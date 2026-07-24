@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DQL Builder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+
+  <div id="dql-builder" class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1>DQL Builder</h1>
+      </div>
+      <p class="tagline">Per-parameter filters, nested edges, live DQL.</p>
+      <button type="button" id="loadSchemaBtn" class="btn-ghost">Load schema</button>
+    </header>
+
+    <main class="workspace">
+      <aside class="query-panel">
+        <div class="panel-label">
+          <span class="panel-title">
+            DQL
+            <span id="dqlDirtyBadge" class="dirty-badge" hidden>edited</span>
+          </span>
+          <div class="panel-actions">
+            <button type="button" id="applyDqlBtn" class="btn-ghost btn-apply" hidden title="Apply editor to canvas (Ctrl+Enter)">Apply</button>
+            <button type="button" id="revertDqlBtn" class="btn-ghost" hidden title="Discard editor changes">Revert</button>
+            <button type="button" id="copyBtn" class="btn-ghost" disabled>Copy</button>
+          </div>
+        </div>
+        <div id="dqlEditor" class="editor-host"></div>
+        <p id="dqlEditHint" class="editor-hint" hidden>Unsaved edits — <kbd>Ctrl</kbd>+<kbd>Enter</kbd> applies to the canvas, or click Apply.</p>
+        <div class="panel-label vars-label">
+          <span>Variables</span>
+          <button type="button" id="copyVarsBtn" class="btn-ghost" disabled>Copy</button>
+        </div>
+        <div id="varsEditor" class="editor-host vars-host"></div>
+      </aside>
+
+      <div class="canvas-wrap">
+        <div class="panel-label">
+          <span>Canvas</span>
+          <div class="panel-actions">
+            <button type="button" id="clearBtn" class="btn-ghost">Clear</button>
+          </div>
+        </div>
+        <div id="canvas" class="canvas" tabindex="0">
+          <nav id="entityDock" class="entity-dock" aria-label="Add entities"></nav>
+          <div class="canvas-empty" id="canvasEmpty">
+            Edit DQL on the left, or click / drag an entity from the dock.
+          </div>
+        </div>
+        <section class="builder-console" id="builderConsole" aria-label="Builder console">
+          <div class="console-toolbar">
+            <button type="button" id="consoleClearBtn" class="console-tool-btn" title="Clear console" aria-label="Clear console">
+              <span class="console-clear-icon" aria-hidden="true"></span>
+            </button>
+            <label class="console-filter">
+              <span class="console-filter-icon" aria-hidden="true"></span>
+              <input type="search" id="consoleFilter" placeholder="Filter" spellcheck="false" />
+            </label>
+            <select id="consoleLevel" class="console-level" title="Log level">
+              <option value="all">All levels</option>
+              <option value="error">Errors</option>
+              <option value="warn">Warnings</option>
+              <option value="info">Info</option>
+            </select>
+            <div class="console-counts" aria-live="polite">
+              <span class="console-count is-error" id="consoleErrorCount" title="Errors">
+                <span class="console-count-icon" aria-hidden="true"></span>
+                <span class="console-count-num">0</span>
+              </span>
+              <span class="console-count is-warn" id="consoleWarnCount" title="Warnings">
+                <span class="console-count-icon" aria-hidden="true"></span>
+                <span class="console-count-num">0</span>
+              </span>
+            </div>
+          </div>
+          <div class="console-output" id="consoleOutput" role="log" aria-relevant="additions"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="schemaModal" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="schemaModalTitle">
+      <header class="modal-head">
+        <h2 id="schemaModalTitle">Load GraphQL schema</h2>
+        <button type="button" id="schemaCloseBtn" class="modal-close" aria-label="Close">×</button>
+      </header>
+      <p class="modal-hint">
+        Point at a GraphQL endpoint — e.g.
+        <code>https://api.example.com/graphql</code>. The builder runs an introspection
+        query and falls back to <code>?sdl</code>. The API must allow CORS from this origin.
+      </p>
+      <div class="modal-row">
+        <input type="url" id="schemaUrl" placeholder="https://api.example.com/graphql" spellcheck="false" />
+        <button type="button" id="schemaFetchBtn" class="btn-solid">Fetch</button>
+      </div>
+      <p class="modal-divider"><span>or paste it</span></p>
+      <textarea
+        id="schemaText"
+        placeholder="Paste SDL (type User { … }) or introspection JSON"
+        spellcheck="false"
+      ></textarea>
+      <div class="modal-actions">
+        <button type="button" id="schemaSampleBtn" class="btn-ghost">Reset to sample</button>
+        <span id="schemaStatus" class="modal-status" role="status"></span>
+        <button type="button" id="schemaApplyBtn" class="btn-solid">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+  <script src="schema.js"></script>
+  <script src="schema-loader.js"></script>
+  <script src="query-parser.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
