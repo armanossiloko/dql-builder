@@ -1,23 +1,23 @@
 /**
- * Converts Dgraph schema JSON — the result of running:
- *
- *   schema { }
- *
- * — into the builder's entity format:
+ * Converts Dgraph schema JSON — the result of running `schema { }` — into the
+ * builder's entity format:
  *   { TypeName: { color, fields: [{ name, type, kind, ofType? }] } }
  *
- * Typical response shape (with or without a `data` wrapper):
+ * Expected shape (keys are case-insensitive; PascalCase shown):
  * {
- *   "data": {
- *     "schema": [
- *       { "predicate": "name", "type": "string", "index": true, "tokenizer": ["term"] },
- *       { "predicate": "posts", "type": "uid", "list": true }
- *     ],
- *     "types": [
- *       { "name": "User", "fields": [ { "name": "name" }, { "name": "posts" } ] }
- *     ]
- *   }
+ *   "Schema": [
+ *     { "Predicate": "name", "Type": "string", "Index": true, "Tokenizer": ["term"] },
+ *     { "Predicate": "posts", "Type": "uid", "List": true }
+ *   ],
+ *   "Types": [
+ *     {
+ *       "Name": "User",
+ *       "Fields": [ { "Name": "name" }, { "Name": "posts" } ]
+ *     }
+ *   ]
  * }
+ *
+ * A `"data"` / `"Data"` wrapper is also accepted.
  */
 window.DQLSchemaLoader = (() => {
   const COLORS = [
@@ -90,54 +90,84 @@ window.DQLSchemaLoader = (() => {
     return fields;
   }
 
+  /** Read obj[key] case-insensitively (first match wins). */
+  function getCI(obj, key) {
+    if (!obj || typeof obj !== "object") return undefined;
+    if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+    const want = String(key).toLowerCase();
+    for (const k of Object.keys(obj)) {
+      if (k.toLowerCase() === want) return obj[k];
+    }
+    return undefined;
+  }
+
+  function pickCI(obj, ...keys) {
+    for (const key of keys) {
+      const value = getCI(obj, key);
+      if (value !== undefined && value !== null) return value;
+    }
+    return undefined;
+  }
+
+  function schemaRoot(payload) {
+    if (!payload || typeof payload !== "object") return null;
+    const nested = getCI(payload, "data");
+    if (nested && typeof nested === "object") {
+      if (Array.isArray(getCI(nested, "schema")) || Array.isArray(getCI(nested, "types"))) {
+        return nested;
+      }
+    }
+    if (Array.isArray(getCI(payload, "schema")) || Array.isArray(getCI(payload, "types"))) {
+      return payload;
+    }
+    return null;
+  }
+
   function isSchemaPayload(obj) {
-    if (!obj || typeof obj !== "object") return false;
-    const root = obj.data && typeof obj.data === "object" ? obj.data : obj;
-    return Array.isArray(root.schema) || Array.isArray(root.types);
+    return schemaRoot(obj) != null;
   }
 
   /**
    * @param {object} payload schema query JSON
    */
   function fromSchemaJson(payload) {
-    if (!isSchemaPayload(payload)) {
+    const data = schemaRoot(payload);
+    if (!data) {
       throw new Error(
-        'Not a Dgraph schema JSON. Expected { "schema": [...], "types": [...] } (optional "data" wrapper).'
+        'Not a Dgraph schema JSON. Expected { "Schema": [...], "Types": [...] } (keys are case-insensitive).'
       );
     }
 
-    const data = payload.data && (payload.data.schema || payload.data.types)
-      ? payload.data
-      : payload;
-
     const predicates = new Map();
-    (data.schema || []).forEach((row) => {
+    (getCI(data, "schema") || []).forEach((row) => {
       if (!row || typeof row !== "object") return;
-      const name = stripName(row.predicate || row.name);
-      if (!name || name.startsWith("dgraph.")) return;
+      const name = stripName(pickCI(row, "predicate", "name"));
+      if (!name || name.toLowerCase().startsWith("dgraph.")) return;
 
-      let type = String(row.type || "string");
-      let list = !!row.list;
+      let type = String(pickCI(row, "type") || "string");
+      let list = !!pickCI(row, "list");
       // Some exports use type: "[uid]" / "[string]" instead of list: true
       const listMatch = type.match(/^\[(.+)\]$/);
       if (listMatch) {
         list = true;
         type = listMatch[1];
       }
-      type = type.toLowerCase() === "datetime" ? "datetime" : type.toLowerCase();
+      type = type.toLowerCase();
 
       predicates.set(name, { type, list });
     });
 
     const types = new Map();
-    (data.types || []).forEach((row) => {
+    (getCI(data, "types") || []).forEach((row) => {
       if (!row || typeof row !== "object") return;
-      const typeName = stripName(row.name);
-      if (!typeName || typeName.startsWith("dgraph.")) return;
+      const typeName = stripName(pickCI(row, "name"));
+      if (!typeName || typeName.toLowerCase().startsWith("dgraph.")) return;
 
-      const fields = (row.fields || [])
-        .map((f) => stripName(typeof f === "string" ? f : f?.name))
-        .filter((n) => n && !n.startsWith("dgraph."));
+      const fields = (getCI(row, "fields") || [])
+        .map((f) =>
+          stripName(typeof f === "string" ? f : pickCI(f, "name"))
+        )
+        .filter((n) => n && !n.toLowerCase().startsWith("dgraph."));
       if (fields.length) types.set(typeName, fields);
     });
 
