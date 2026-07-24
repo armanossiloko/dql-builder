@@ -1,7 +1,23 @@
 /**
- * Converts a GraphQL schema (introspection JSON or SDL text) into the
- * builder's entity format:
+ * Converts Dgraph schema JSON — the result of running:
+ *
+ *   schema { }
+ *
+ * — into the builder's entity format:
  *   { TypeName: { color, fields: [{ name, type, kind, ofType? }] } }
+ *
+ * Typical response shape (with or without a `data` wrapper):
+ * {
+ *   "data": {
+ *     "schema": [
+ *       { "predicate": "name", "type": "string", "index": true, "tokenizer": ["term"] },
+ *       { "predicate": "posts", "type": "uid", "list": true }
+ *     ],
+ *     "types": [
+ *       { "name": "User", "fields": [ { "name": "name" }, { "name": "posts" } ] }
+ *     ]
+ *   }
+ * }
  */
 window.DQLSchemaLoader = (() => {
   const COLORS = [
@@ -9,71 +25,8 @@ window.DQLSchemaLoader = (() => {
     "#be185d", "#4d7c0f", "#0e7490", "#a16207", "#6d28d9", "#374151",
   ];
 
-  const SCALAR_MAP = {
-    ID: "uid",
-    String: "string",
-    Int: "int",
-    Long: "int",
-    Short: "int",
-    Byte: "int",
-    Float: "float",
-    Decimal: "float",
-    Boolean: "bool",
-    DateTime: "datetime",
-    Date: "datetime",
-    LocalDate: "datetime",
-    LocalDateTime: "datetime",
-  };
-
-  const INTROSPECTION_QUERY = `
-    query BuilderIntrospection {
-      __schema {
-        queryType { name }
-        mutationType { name }
-        subscriptionType { name }
-        types {
-          kind
-          name
-          fields {
-            name
-            type {
-              kind name
-              ofType { kind name
-                ofType { kind name
-                  ofType { kind name
-                    ofType { kind name
-                      ofType { kind name
-                        ofType { kind name } } } } } }
-            }
-          }
-        }
-      }
-    }
-  `;
-
-  function mapScalar(graphqlName) {
-    return SCALAR_MAP[graphqlName] || "string";
-  }
-
-  /** Remove edges pointing at dropped types, then drop empty types (fixpoint). */
-  function prune(out) {
-    let changed = true;
-    while (changed) {
-      changed = false;
-      Object.entries(out).forEach(([name, def]) => {
-        const kept = def.fields.filter((f) => f.kind !== "object" || out[f.ofType]);
-        if (kept.length !== def.fields.length) {
-          def.fields = kept;
-          changed = true;
-        }
-        if (!def.fields.length) {
-          delete out[name];
-          changed = true;
-        }
-      });
-    }
-    return out;
-  }
+  // Dgraph schema queries are not wrapped in outer `{ … }` like normal DQL queries.
+  const SCHEMA_QUERY = "schema { }";
 
   function assignColors(out) {
     Object.values(out).forEach((def, i) => {
@@ -82,161 +35,249 @@ window.DQLSchemaLoader = (() => {
     return out;
   }
 
-  /* ---------- Introspection JSON ---------- */
-
-  function unwrapTypeRef(typeRef) {
-    let t = typeRef;
-    let isList = false;
-    while (t && (t.kind === "NON_NULL" || t.kind === "LIST")) {
-      if (t.kind === "LIST") isList = true;
-      t = t.ofType;
-    }
-    return { kind: t?.kind, name: t?.name, isList };
+  function stripName(raw) {
+    const t = String(raw || "").trim();
+    if (t.startsWith("<") && t.endsWith(">")) return t.slice(1, -1).trim();
+    return t;
   }
 
-  function fromIntrospection(payload) {
-    const s = payload?.data?.__schema || payload?.__schema || payload;
-    if (!s || !Array.isArray(s.types)) {
-      throw new Error("Not an introspection result (missing __schema.types)");
+  function normalizeScalar(typeName) {
+    const t = String(typeName || "string").toLowerCase();
+    if (t === "default" || t === "password") return "string";
+    if (t === "datetime" || t === "dateTime".toLowerCase()) return "datetime";
+    if (t === "float32vector" || t === "bigfloat") return "float";
+    if (["int", "float", "string", "bool", "datetime", "geo", "uid"].includes(t)) {
+      return t;
+    }
+    return "string";
+  }
+
+  function guessOfType(predName, typeNames, selfType) {
+    let base = String(predName || "");
+    if (base.includes(".")) base = base.split(".").pop();
+
+    const ALIASES = {
+      author: ["Author", "User", "Person"],
+      owner: ["Owner", "User", "Person"],
+      creator: ["Creator", "User", "Person"],
+      user: ["User", "Person"],
+      writer: ["Writer", "User", "Person"],
+    };
+
+    if (/ies$/i.test(base)) base = `${base.slice(0, -3)}y`;
+    else if (/ses$/i.test(base)) base = base.slice(0, -2);
+    else if (/s$/i.test(base) && !/ss$/i.test(base)) base = base.slice(0, -1);
+
+    const candidates = [
+      base,
+      base.charAt(0).toUpperCase() + base.slice(1),
+      ...(ALIASES[base.toLowerCase()] || []),
+      predName,
+    ];
+    for (const c of candidates) {
+      if (typeNames.has(c) && c !== selfType) return c;
+    }
+    for (const t of typeNames) {
+      if (t !== selfType && t.toLowerCase() === base.toLowerCase()) return t;
+    }
+    return null;
+  }
+
+  function ensureUidField(fields) {
+    if (!fields.some((f) => f.name === "uid")) {
+      fields.unshift({ name: "uid", type: "uid", kind: "scalar" });
+    }
+    return fields;
+  }
+
+  function isSchemaPayload(obj) {
+    if (!obj || typeof obj !== "object") return false;
+    const root = obj.data && typeof obj.data === "object" ? obj.data : obj;
+    return Array.isArray(root.schema) || Array.isArray(root.types);
+  }
+
+  /**
+   * @param {object} payload schema query JSON
+   */
+  function fromSchemaJson(payload) {
+    if (!isSchemaPayload(payload)) {
+      throw new Error(
+        'Not a Dgraph schema JSON. Expected { "schema": [...], "types": [...] } (optional "data" wrapper).'
+      );
     }
 
-    const roots = new Set(
-      [s.queryType?.name, s.mutationType?.name, s.subscriptionType?.name].filter(Boolean)
-    );
-    const entityTypes = s.types.filter(
-      (t) =>
-        (t.kind === "OBJECT" || t.kind === "INTERFACE") &&
-        !t.name.startsWith("__") &&
-        !roots.has(t.name)
-    );
-    const entityNames = new Set(entityTypes.map((t) => t.name));
+    const data = payload.data && (payload.data.schema || payload.data.types)
+      ? payload.data
+      : payload;
 
-    const out = {};
-    entityTypes.forEach((t) => {
-      const fields = (t.fields || [])
-        .map((f) => {
-          const ref = unwrapTypeRef(f.type);
-          const isComposite =
-            ref.kind === "OBJECT" || ref.kind === "INTERFACE" || ref.kind === "UNION";
-          if (isComposite) {
-            if (!entityNames.has(ref.name)) return null;
-            return {
-              name: f.name,
-              type: ref.isList ? "[uid]" : "uid",
-              kind: "object",
-              ofType: ref.name,
-            };
-          }
-          // SCALAR / ENUM
-          return { name: f.name, type: mapScalar(ref.name), kind: "scalar" };
-        })
-        .filter(Boolean);
-      if (fields.length) out[t.name] = { color: "", fields };
+    const predicates = new Map();
+    (data.schema || []).forEach((row) => {
+      if (!row || typeof row !== "object") return;
+      const name = stripName(row.predicate || row.name);
+      if (!name || name.startsWith("dgraph.")) return;
+
+      let type = String(row.type || "string");
+      let list = !!row.list;
+      // Some exports use type: "[uid]" / "[string]" instead of list: true
+      const listMatch = type.match(/^\[(.+)\]$/);
+      if (listMatch) {
+        list = true;
+        type = listMatch[1];
+      }
+      type = type.toLowerCase() === "datetime" ? "datetime" : type.toLowerCase();
+
+      predicates.set(name, { type, list });
     });
 
-    return assignColors(prune(out));
-  }
+    const types = new Map();
+    (data.types || []).forEach((row) => {
+      if (!row || typeof row !== "object") return;
+      const typeName = stripName(row.name);
+      if (!typeName || typeName.startsWith("dgraph.")) return;
 
-  /* ---------- SDL text ---------- */
-
-  function fromSdl(sdlText) {
-    let text = String(sdlText)
-      .replace(/"""[\s\S]*?"""/g, " ")
-      .replace(/#[^\n]*/g, " ");
-
-    // Custom root operation types declared via `schema { query: MyQuery ... }`.
-    const roots = new Set(["Query", "Mutation", "Subscription"]);
-    const schemaBlock = text.match(/\bschema\b[^{]*\{([^}]*)\}/);
-    if (schemaBlock) {
-      [...schemaBlock[1].matchAll(/\b(?:query|mutation|subscription)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)/g)]
-        .forEach((m) => roots.add(m[1]));
-    }
-
-    const blockRe = /\b(type|interface)\s+([A-Za-z_][A-Za-z0-9_]*)[^{]*\{([^}]*)\}/g;
-    const blocks = [...text.matchAll(blockRe)].filter((m) => !roots.has(m[2]));
-    const entityNames = new Set(blocks.map((m) => m[2]));
-    if (!blocks.length) {
-      throw new Error("No type/interface definitions found in SDL");
-    }
-
-    const out = {};
-    blocks.forEach(([, , typeName, body]) => {
-      // Strip field argument lists and directives so only `name: TypeRef` remains.
-      const cleaned = body
-        .replace(/\((?:[^()"]|"(?:\\.|[^"\\])*")*\)/g, "")
-        .replace(/@[A-Za-z_][A-Za-z0-9_]*/g, "");
-
-      const fields = [...cleaned.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(\[{0,3}[A-Za-z_][A-Za-z0-9_]*[!\]]{0,6})/g)]
-        .map(([, fieldName, rawRef]) => {
-          const isList = rawRef.includes("[");
-          const refName = rawRef.replace(/[[\]!\s]/g, "");
-          if (!refName) return null;
-          if (entityNames.has(refName)) {
-            return {
-              name: fieldName,
-              type: isList ? "[uid]" : "uid",
-              kind: "object",
-              ofType: refName,
-            };
-          }
-          return { name: fieldName, type: mapScalar(refName), kind: "scalar" };
-        })
-        .filter(Boolean);
-      if (fields.length) out[typeName] = { color: "", fields };
+      const fields = (row.fields || [])
+        .map((f) => stripName(typeof f === "string" ? f : f?.name))
+        .filter((n) => n && !n.startsWith("dgraph."));
+      if (fields.length) types.set(typeName, fields);
     });
 
-    return assignColors(prune(out));
-  }
+    if (!types.size) {
+      throw new Error(
+        'Schema JSON has no usable "types". The builder needs type definitions to list entities.'
+      );
+    }
 
-  /* ---------- Pasted text (either format) ---------- */
+    // Predicates missing from schema[] (types-only paste): default to string.
+    types.forEach((fields) => {
+      fields.forEach((f) => {
+        if (!predicates.has(f)) predicates.set(f, { type: "string", list: false });
+      });
+    });
+
+    const typeNames = new Set(types.keys());
+    const out = {};
+
+    types.forEach((fieldNames, typeName) => {
+      const fields = [];
+      fieldNames.forEach((pred) => {
+        if (!pred || pred === "uid") return;
+        const meta = predicates.get(pred) || { type: "string", list: false };
+        const isUid = meta.type === "uid";
+
+        if (isUid) {
+          const ofType = guessOfType(pred, typeNames, typeName);
+          if (ofType) {
+            fields.push({
+              name: pred,
+              type: meta.list ? "[uid]" : "uid",
+              kind: "object",
+              ofType,
+            });
+          } else {
+            fields.push({
+              name: pred,
+              type: meta.list ? "[uid]" : "uid",
+              kind: "scalar",
+            });
+          }
+        } else {
+          fields.push({
+            name: pred,
+            type: normalizeScalar(meta.type),
+            kind: "scalar",
+          });
+        }
+      });
+      out[typeName] = { color: "", fields: ensureUidField(fields) };
+    });
+
+    return assignColors(out);
+  }
 
   function fromText(raw) {
     const text = String(raw || "").replace(/^\uFEFF/, "").trim();
     if (!text) throw new Error("Nothing to parse");
-    if (text.startsWith("{")) {
-      try {
-        return fromIntrospection(JSON.parse(text));
-      } catch (err) {
-        throw new Error(`Invalid introspection JSON: ${err.message}`);
-      }
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (err) {
+      throw new Error(
+        `Expected JSON from a Dgraph \`schema { }\` query. ${err.message}`
+      );
     }
-    return fromSdl(text);
+    return fromSchemaJson(json);
   }
 
-  /* ---------- Live endpoint ---------- */
+  function queryEndpoints(url) {
+    const base = String(url || "").trim().replace(/\/$/, "");
+    if (!base) return [];
+    const endpoints = [base];
+    if (!/\/query$/i.test(base)) endpoints.push(`${base}/query`);
+    return [...new Set(endpoints)];
+  }
+
+  async function tryQuerySchema(endpoint) {
+    const attempts = [
+      {
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ query: SCHEMA_QUERY }),
+      },
+      {
+        headers: { "Content-Type": "application/dql", Accept: "application/json" },
+        body: SCHEMA_QUERY,
+      },
+      {
+        headers: { "Content-Type": "text/plain", Accept: "application/json" },
+        body: SCHEMA_QUERY,
+      },
+    ];
+
+    const errors = [];
+    for (const attempt of attempts) {
+      try {
+        const res = await fetch(endpoint, { method: "POST", ...attempt });
+        if (!res.ok) {
+          errors.push(`POST ${endpoint} → HTTP ${res.status}`);
+          continue;
+        }
+        const json = await res.json();
+        if (json?.errors?.length) {
+          errors.push(json.errors.map((e) => e.message || String(e)).join("; "));
+          continue;
+        }
+        if (isSchemaPayload(json)) return fromSchemaJson(json);
+        errors.push(`POST ${endpoint} returned JSON without schema/types`);
+      } catch (err) {
+        errors.push(`POST ${endpoint} failed: ${err.message}`);
+      }
+    }
+    throw new Error(errors.join(" · "));
+  }
 
   async function fetchSchema(url) {
     const errors = [];
+    const endpoints = queryEndpoints(url);
+    if (!endpoints.length) throw new Error("Enter a Dgraph Alpha URL first.");
 
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: INTROSPECTION_QUERY }),
-      });
-      if (res.ok) {
-        const json = await res.json();
-        if (json?.data?.__schema) return fromIntrospection(json);
-        errors.push("endpoint answered without __schema (introspection disabled?)");
-      } else {
-        errors.push(`introspection POST returned HTTP ${res.status}`);
+    for (const endpoint of endpoints) {
+      try {
+        return await tryQuerySchema(endpoint);
+      } catch (err) {
+        errors.push(err.message);
       }
-    } catch (err) {
-      errors.push(`introspection POST failed: ${err.message}`);
     }
 
-    // Some GraphQL servers expose SDL at <endpoint>?sdl.
+    // Allow fetching a hosted schema JSON file.
     try {
-      const sdlUrl = url.includes("?") ? `${url}&sdl` : `${url}?sdl`;
-      const res = await fetch(sdlUrl);
-      if (res.ok) return fromSdl(await res.text());
-      errors.push(`GET ?sdl returned HTTP ${res.status}`);
+      const res = await fetch(url);
+      if (res.ok) return fromSchemaJson(await res.json());
+      errors.push(`GET ${url} → HTTP ${res.status}`);
     } catch (err) {
-      errors.push(`GET ?sdl failed: ${err.message}`);
+      errors.push(`GET failed: ${err.message}`);
     }
 
     throw new Error(errors.join(" · "));
   }
 
-  return { fromIntrospection, fromSdl, fromText, fetchSchema };
+  return { fromSchemaJson, fromText, fetchSchema };
 })();

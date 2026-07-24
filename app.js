@@ -1616,8 +1616,8 @@
   schemaFetchBtn.addEventListener("click", async () => {
     const url = schemaUrlInput.value.trim();
     if (!url) {
-      setSchemaStatus("Enter the GraphQL endpoint URL first.", "error");
-      consoleError("Enter the GraphQL endpoint URL first.", "schema");
+      setSchemaStatus("Enter the Dgraph Alpha URL first.", "error");
+      consoleError("Enter the Dgraph Alpha URL first.", "schema");
       return;
     }
     schemaFetchBtn.disabled = true;

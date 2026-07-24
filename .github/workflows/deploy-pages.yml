@@ -1,9 +1,9 @@
 # Deploy the static DQL Builder site to GitHub Pages.
 #
-# One-time setup (required once per repo):
-#   Settings → Pages → Build and deployment → Source: GitHub Actions
+# REQUIRED once (workflow cannot do this with GITHUB_TOKEN):
+#   Repo → Settings → Pages → Build and deployment → Source: GitHub Actions
+# Then re-run this workflow from the Actions tab (or push again).
 #
-# After that, every push to master (and manual runs) publishes automatically.
 # Site URL: https://<owner>.github.io/<repo>/
 
 name: Deploy to GitHub Pages
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -38,7 +38,9 @@ jobs:
       - name: Prepare site files
         run: |
           mkdir _site
-          cp index.html styles.css app.js schema.js schema-loader.js query-parser.js .nojekyll _site/
+          cp index.html styles.css app.js schema.js schema-loader.js query-parser.js _site/
+          # Optional: keep Jekyll from touching the publish dir if GitHub ever runs it
+          touch _site/.nojekyll
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
@@ -47,4 +49,4 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

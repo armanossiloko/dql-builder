@@ -92,22 +92,22 @@
   <div id="schemaModal" class="modal-overlay" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="schemaModalTitle">
       <header class="modal-head">
-        <h2 id="schemaModalTitle">Load GraphQL schema</h2>
+        <h2 id="schemaModalTitle">Load Dgraph schema</h2>
         <button type="button" id="schemaCloseBtn" class="modal-close" aria-label="Close">×</button>
       </header>
       <p class="modal-hint">
-        Point at a GraphQL endpoint — e.g.
-        <code>https://api.example.com/graphql</code>. The builder runs an introspection
-        query and falls back to <code>?sdl</code>. The API must allow CORS from this origin.
+        Fetch from a Dgraph Alpha (runs <code>schema { }</code>), or paste the JSON
+        result of that query from Ratel. Example:
+        <code>http://localhost:8080</code>. CORS must allow this origin.
       </p>
       <div class="modal-row">
-        <input type="url" id="schemaUrl" placeholder="https://api.example.com/graphql" spellcheck="false" />
+        <input type="url" id="schemaUrl" placeholder="http://localhost:8080" spellcheck="false" />
         <button type="button" id="schemaFetchBtn" class="btn-solid">Fetch</button>
       </div>
-      <p class="modal-divider"><span>or paste it</span></p>
+      <p class="modal-divider"><span>or paste <code>schema { }</code> JSON</span></p>
       <textarea
         id="schemaText"
-        placeholder="Paste SDL (type User { … }) or introspection JSON"
+        placeholder='{&#10;  "data": {&#10;    "schema": [&#10;      { "predicate": "name", "type": "string" },&#10;      { "predicate": "posts", "type": "uid", "list": true }&#10;    ],&#10;    "types": [&#10;      {&#10;        "name": "User",&#10;        "fields": [{ "name": "name" }, { "name": "posts" }]&#10;      }&#10;    ]&#10;  }&#10;}'
         spellcheck="false"
       ></textarea>
       <div class="modal-actions">
