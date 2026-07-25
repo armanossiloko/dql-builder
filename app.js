@@ -2,7 +2,6 @@
   let schema = window.DQL_SCHEMA;
   const PARAM_TYPES = ["string", "int", "float", "bool"];
   const FILTER_FUNCS = [
-    { value: "", label: "no filter" },
     { value: "eq", label: "eq" },
     { value: "ge", label: "ge" },
     { value: "le", label: "le" },
@@ -43,12 +42,18 @@
 
   /**
    * Each canvas node is one DQL query block.
-   * `selection` tree: { predicate: null | { nested… } }
-   * Each param owns its filter binding (func + predicate).
-   * @typedef {{ id: string, name: string, type: string, value: string, func: string, predicate: string }} Param
+   * Parameters are $variables only.
+   * Filters are separate groups (AND/OR) on the root or on object edges.
+   * @typedef {{ id: string, name: string, type: string, value: string, mode: "var"|"default" }} Param
+   * @typedef {{
+   *   id: string, func: string, predicate: string,
+   *   valueMode: "literal"|"param", literal: string, paramName: string
+   * }} FilterCond
+   * @typedef {{ op: "AND"|"OR", conditions: FilterCond[] }} FilterGroup
    * @typedef {{
    *   id: string, type: string, name: string, x: number, y: number,
-   *   selection: Record<string, any>, params: Param[]
+   *   selection: Record<string, any>, params: Param[],
+   *   rootFilter: FilterGroup, edgeFilters: Record<string, FilterGroup>
    * }} QueryNode
    * @type {QueryNode[]}
    */
@@ -59,6 +64,7 @@
   let selectedNodeId = null;
   let nodeSeq = 0;
   let paramSeq = 0;
+  let filterSeq = 0;
   const animatedNodes = new Set();
   /** True when `schema` came from the built-in sample (reload picks up schema.js edits). */
   let schemaIsSample = true;
@@ -79,6 +85,7 @@
           selectedNodeId,
           nodeSeq,
           paramSeq,
+          filterSeq,
         })
       );
     } catch {
@@ -117,11 +124,22 @@
         return false;
       }
 
-      nodes = data.nodes;
+      nodes = data.nodes.map((n) => migrateNode({ ...n }));
       selectedNodeId = data.selectedNodeId || null;
       nodeSeq = Number(data.nodeSeq) || nodes.length;
       paramSeq = Number(data.paramSeq) || 0;
-      nodes.forEach((n) => animatedNodes.add(n.id));
+      filterSeq = Number(data.filterSeq) || 0;
+      nodes.forEach((n) => {
+        animatedNodes.add(n.id);
+        (n.rootFilter?.conditions || []).forEach((c) => {
+          if (!c.id) c.id = filterUid();
+        });
+        Object.values(n.edgeFilters || {}).forEach((g) => {
+          (g.conditions || []).forEach((c) => {
+            if (!c.id) c.id = filterUid();
+          });
+        });
+      });
       return true;
     } catch {
       return false;
@@ -411,6 +429,113 @@
     return `param-${paramSeq}`;
   }
 
+  function filterUid() {
+    filterSeq += 1;
+    return `filter-${filterSeq}`;
+  }
+
+  function emptyFilterGroup(op = "AND") {
+    return { op: op === "OR" ? "OR" : "AND", conditions: [] };
+  }
+
+  function newFilterCondition(predicate = "", typeHint = "string") {
+    return {
+      id: filterUid(),
+      func: "eq",
+      predicate,
+      valueMode: "literal",
+      literal: defaultParamValue(typeHint),
+      paramName: "",
+    };
+  }
+
+  function ensureFilterGroup(group) {
+    if (!group || typeof group !== "object") return emptyFilterGroup();
+    return {
+      op: group.op === "OR" ? "OR" : "AND",
+      conditions: Array.isArray(group.conditions) ? group.conditions : [],
+    };
+  }
+
+  /** Migrate legacy param-bound filters → rootFilter / edgeFilters. */
+  function migrateNode(node) {
+    if (!node.rootFilter) node.rootFilter = emptyFilterGroup();
+    else node.rootFilter = ensureFilterGroup(node.rootFilter);
+    if (!node.edgeFilters || typeof node.edgeFilters !== "object") node.edgeFilters = {};
+
+    const legacy = [];
+    const kept = [];
+    (node.params || []).forEach((p) => {
+      if (p && p.func && p.predicate) legacy.push(p);
+      else if (p) {
+        kept.push({
+          id: p.id || paramUid(),
+          name: p.name,
+          type: PARAM_TYPES.includes(p.type) ? p.type : "string",
+          value: p.value ?? "",
+          mode: p.mode === "default" ? "default" : "var",
+        });
+      }
+    });
+
+    legacy.forEach((p) => {
+      const walk = splitPredicatePath(node.type, p.predicate) || {
+        edgeParts: [],
+        leaf: p.predicate,
+        edgePath: "",
+      };
+      const unary = isUnaryFilter(p.func);
+      const cond = {
+        id: filterUid(),
+        func: p.func,
+        predicate: walk.leaf,
+        valueMode: p.mode === "literal" || unary ? "literal" : "param",
+        literal: p.mode === "literal" ? String(p.value ?? "") : "",
+        paramName: p.mode === "literal" || unary ? "" : p.name,
+      };
+      if (!walk.edgePath) {
+        node.rootFilter.conditions.push(cond);
+      } else {
+        if (!node.edgeFilters[walk.edgePath]) {
+          node.edgeFilters[walk.edgePath] = emptyFilterGroup();
+        }
+        node.edgeFilters[walk.edgePath].conditions.push(cond);
+      }
+      if (!unary && p.mode !== "literal") {
+        if (!kept.some((k) => k.name === p.name)) {
+          kept.push({
+            id: p.id || paramUid(),
+            name: p.name,
+            type: PARAM_TYPES.includes(p.type) ? p.type : "string",
+            value: p.value ?? "",
+            mode: p.mode === "default" ? "default" : "var",
+          });
+        }
+      }
+    });
+
+    node.params = kept;
+    return node;
+  }
+
+  function typeAtEdgePath(rootType, edgePath) {
+    if (!edgePath) return rootType;
+    const walk = splitPredicatePath(rootType, edgePath);
+    if (!walk) return rootType;
+    let typeName = rootType;
+    for (const edge of walk.edgeParts) {
+      const field = (schema[typeName]?.fields || []).find((f) => f.name === edge);
+      if (!field?.ofType) return typeName;
+      typeName = field.ofType;
+    }
+    const leaf = (schema[typeName]?.fields || []).find((f) => f.name === walk.leaf);
+    return leaf?.ofType || typeName;
+  }
+
+  function scalarOptionsForType(typeName) {
+    return scalarPredicates(typeName).map((f) => ({ value: f.name, label: f.name }));
+  }
+
   function defaultName(typeName) {
     const base = `get${typeName}`;
     if (!nodes.some((n) => n.name === base)) return base;
@@ -684,7 +809,76 @@
 
   /* ---------- Query block rendering ---------- */
 
-  function renderFieldTree(typeName, selection, path, depth, aliases) {
+  function renderFilterValueControls(cond, params) {
+    const unary = isUnaryFilter(cond.func);
+    if (unary) return `<span class="filter-value-blank">—</span>`;
+
+    const mode = cond.valueMode === "param" ? "param" : "literal";
+    const modeOpts = optionsHtml(
+      [
+        { value: "literal", label: "literal" },
+        { value: "param", label: "$param" },
+      ],
+      mode
+    );
+
+    if (mode === "param") {
+      const paramOpts = (params || []).map((p) => ({
+        value: p.name,
+        label: `$${p.name}`,
+      }));
+      return `
+        <select class="filter-value-mode" title="Value source">${modeOpts}</select>
+        <select class="filter-param" title="Parameter">${optionsHtml(
+          paramOpts.length ? paramOpts : [{ value: "", label: "— add a $param" }],
+          cond.paramName || ""
+        )}</select>
+      `;
+    }
+
+    return `
+      <select class="filter-value-mode" title="Value source">${modeOpts}</select>
+      <input type="text" class="filter-literal" value="${escapeAttr(cond.literal || "")}" placeholder="value" spellcheck="false" title="Literal value" />
+    `;
+  }
+
+  function renderFilterGroupPanel(group, typeName, params, { edgePath = "", compact = false } = {}) {
+    const g = ensureFilterGroup(group);
+    const preds = scalarOptionsForType(typeName);
+    const rows = g.conditions
+      .map((cond) => {
+        const unary = isUnaryFilter(cond.func);
+        return `
+          <div class="filter-row" data-filter-id="${cond.id}">
+            <select class="filter-func" title="Filter function">${optionsHtml(FILTER_FUNCS, cond.func || "eq")}</select>
+            <select class="filter-predicate" title="Predicate">${optionsHtml(
+              preds.length ? preds : [{ value: "", label: "—" }],
+              cond.predicate || ""
+            )}</select>
+            ${renderFilterValueControls(cond, params)}
+            <button type="button" class="filter-remove" title="Remove filter" aria-label="Remove filter">×</button>
+          </div>
+        `;
+      })
+      .join("");
+
+    const cls = compact ? "filter-panel is-edge" : "filter-panel is-root";
+    return `
+      <div class="${cls}" data-edge-path="${escapeAttr(edgePath)}">
+        <div class="filter-panel-head">
+          <span class="filter-panel-label">@filter</span>
+          <div class="filter-op-toggle" role="group" aria-label="Combine filters with">
+            <button type="button" class="filter-op-btn${g.op !== "OR" ? " active" : ""}" data-op="AND">AND</button>
+            <button type="button" class="filter-op-btn${g.op === "OR" ? " active" : ""}" data-op="OR">OR</button>
+          </div>
+          <button type="button" class="btn-mini add-filter">+ Add</button>
+        </div>
+        ${rows || '<p class="filter-empty">No conditions</p>'}
+      </div>
+    `;
+  }
+
+  function renderFieldTree(typeName, selection, path, depth, aliases, node) {
     const def = schema[typeName];
     if (!def) return "";
 
@@ -696,11 +890,17 @@
         const isObject = field.kind === "object";
         const objectClass = isObject ? " is-object" : "";
 
+        let edgeFilterHtml = "";
         let nestedHtml = "";
         if (isObject && checked && field.ofType && schema[field.ofType] && depth < 8) {
+          const edgeGroup = node.edgeFilters?.[key] || emptyFilterGroup();
+          edgeFilterHtml = renderFilterGroupPanel(edgeGroup, field.ofType, node.params, {
+            edgePath: key,
+            compact: true,
+          });
           nestedHtml = `
             <ul class="nested-fields" data-depth="${depth + 1}">
-              ${renderFieldTree(field.ofType, selection, fieldPath, depth + 1, aliases)}
+              ${renderFieldTree(field.ofType, selection, fieldPath, depth + 1, aliases, node)}
             </ul>
           `;
         }
@@ -734,6 +934,7 @@
               </label>
               ${aliasHtml}
             </div>
+            ${edgeFilterHtml}
             ${nestedHtml}
           </li>
         `;
@@ -755,35 +956,25 @@
   }
 
   function renderParamsSection(node) {
-    const preds = filterTargets(node.type, node.selection);
-
     const rows = (node.params || [])
       .map((param) => {
         const typeOpts = PARAM_TYPES.map((t) => ({ value: t, label: t }));
-        const unary = isUnaryFilter(param.func);
         return `
           <div class="param-card" data-param-id="${param.id}">
             <div class="param-main">
-              <input type="text" class="param-name" value="${escapeAttr(param.name)}" placeholder="name" spellcheck="false" title="Parameter name" ${param.mode === "literal" || unary ? "disabled" : ""} />
-              <select class="param-type" title="Parameter type" ${unary ? "disabled" : ""}>${optionsHtml(typeOpts, param.type)}</select>
-              <input type="text" class="param-value" value="${escapeAttr(param.value)}" placeholder="${unary ? "—" : "value"}" spellcheck="false" title="Sample value" ${unary ? "disabled" : ""} />
-              <button type="button" class="param-remove" title="Remove parameter" aria-label="Remove parameter">×</button>
-            </div>
-            <div class="param-filter">
-              <select class="param-func" title="Filter function">${optionsHtml(FILTER_FUNCS, param.func)}</select>
-              <select class="param-predicate" title="Predicate" ${param.func ? "" : "disabled"}>
-                ${optionsHtml(preds.length ? preds : [{ value: "", label: "—" }], param.predicate)}
-              </select>
-              <select class="param-mode" title="How the value is passed: $variable, $variable with a default in the signature, or an inline literal (no variable)" ${unary ? "disabled" : ""}>
+              <input type="text" class="param-name" value="${escapeAttr(param.name)}" placeholder="name" spellcheck="false" title="Parameter name" />
+              <select class="param-type" title="Parameter type">${optionsHtml(typeOpts, param.type)}</select>
+              <input type="text" class="param-value" value="${escapeAttr(param.value)}" placeholder="sample" spellcheck="false" title="Sample value for Variables JSON" />
+              <select class="param-mode" title="$variable, or $variable with a default in the signature">
                 ${optionsHtml(
                   [
                     { value: "var", label: "$var" },
                     { value: "default", label: "$ = def" },
-                    { value: "literal", label: "literal" },
                   ],
-                  unary ? "literal" : param.mode || "var"
+                  param.mode || "var"
                 )}
               </select>
+              <button type="button" class="param-remove" title="Remove parameter" aria-label="Remove parameter">×</button>
             </div>
           </div>
         `;
@@ -796,7 +987,18 @@
           <span class="block-section-title">Parameters</span>
           <button type="button" class="btn-mini add-param">+ Add</button>
         </div>
-        ${rows || '<p class="param-empty">No $params — add one to filter this block</p>'}
+        ${rows || '<p class="param-empty">$variables for filters to reference</p>'}
+      </div>
+    `;
+  }
+
+  function renderRootFiltersSection(node) {
+    return `
+      <div class="block-section filters-section">
+        <div class="block-section-head no-margin">
+          <span class="block-section-title">Root filters</span>
+        </div>
+        ${renderFilterGroupPanel(node.rootFilter, node.type, node.params, { edgePath: "" })}
       </div>
     `;
   }
@@ -877,7 +1079,8 @@
         </header>
         ${renderDirectivesSection(node)}
         ${renderParamsSection(node)}
-        <ul class="entity-fields">${renderFieldTree(node.type, node.selection, [], 0, node.aliases || {})}</ul>
+        ${renderRootFiltersSection(node)}
+        <ul class="entity-fields">${renderFieldTree(node.type, node.selection, [], 0, node.aliases || {}, node)}</ul>
       `;
 
       const header = el.querySelector(".entity-node-header");
@@ -984,26 +1187,17 @@
 
       el.querySelector(".add-param").addEventListener("click", (e) => {
         e.stopPropagation();
-        const preds = scalarPredicates(node.type);
-        const used = new Set(node.params.map((p) => p.predicate));
-        const nextPred = preds.find((p) => !used.has(p.name)) || preds[0];
-        const predName = nextPred?.name || "value";
-        const type = paramTypeForPredicate(node.type, predName);
-
-        let name = sanitizeName(predName, `param${node.params.length + 1}`);
+        let name = `param${node.params.length + 1}`;
         let i = 2;
         while (node.params.some((p) => p.name === name)) {
-          name = `${sanitizeName(predName, "param")}${i}`;
+          name = `param${i}`;
           i += 1;
         }
-
         node.params.push({
           id: paramUid(),
           name,
-          type,
-          value: defaultParamValue(type),
-          func: "eq",
-          predicate: predName,
+          type: "string",
+          value: "",
           mode: "var",
         });
         renderNodes();
@@ -1017,26 +1211,40 @@
         const nameEl = card.querySelector(".param-name");
         const typeEl = card.querySelector(".param-type");
         const valueEl = card.querySelector(".param-value");
-        const removeBtn = card.querySelector(".param-remove");
-        const funcEl = card.querySelector(".param-func");
-        const predEl = card.querySelector(".param-predicate");
         const modeEl = card.querySelector(".param-mode");
+        const removeBtn = card.querySelector(".param-remove");
 
-        [nameEl, typeEl, valueEl, removeBtn, funcEl, predEl, modeEl].forEach(stopDragPropagation);
+        [nameEl, typeEl, valueEl, modeEl, removeBtn].forEach(stopDragPropagation);
 
         modeEl.addEventListener("change", () => {
-          param.mode = modeEl.value;
-          renderNodes();
+          param.mode = modeEl.value === "default" ? "default" : "var";
           refreshQuery();
         });
-
         nameEl.addEventListener("input", () => {
+          const prev = param.name;
           param.name = nameEl.value.replace(/^\$/, "");
+          // Keep filter references in sync while typing.
+          const renameIn = (group) => {
+            (group?.conditions || []).forEach((c) => {
+              if (c.valueMode === "param" && c.paramName === prev) c.paramName = param.name;
+            });
+          };
+          renameIn(node.rootFilter);
+          Object.values(node.edgeFilters || {}).forEach(renameIn);
           refreshQuery();
         });
         nameEl.addEventListener("change", () => {
+          const prev = param.name;
           param.name = sanitizeName(param.name, "param");
           nameEl.value = param.name;
+          const renameIn = (group) => {
+            (group?.conditions || []).forEach((c) => {
+              if (c.valueMode === "param" && c.paramName === prev) c.paramName = param.name;
+            });
+          };
+          renameIn(node.rootFilter);
+          Object.values(node.edgeFilters || {}).forEach(renameIn);
+          renderNodes();
           refreshQuery();
         });
         typeEl.addEventListener("change", () => {
@@ -1048,46 +1256,138 @@
           param.value = valueEl.value;
           refreshQuery();
         });
-        funcEl.addEventListener("change", () => {
-          param.func = funcEl.value;
-          if (param.func && !param.predicate) {
-            param.predicate = scalarPredicates(node.type)[0]?.name || "";
-          }
-          if (isUnaryFilter(param.func)) {
-            param.mode = "literal";
-            param.value = "";
-          }
-          renderNodes();
-          refreshQuery();
-        });
-        predEl.addEventListener("change", () => {
-          const oldWalk = splitPredicatePath(node.type, param.predicate);
-          const oldLeaf = oldWalk?.leaf || param.predicate.split(".").pop();
-          param.predicate = predEl.value;
-          // Keep the param type in sync with the bound predicate.
-          param.type = paramTypeForPredicate(node.type, param.predicate);
-          // If the name was auto-derived from the old predicate, follow the new one.
-          const newWalk = splitPredicatePath(node.type, param.predicate);
-          const newLeaf = newWalk?.leaf || param.predicate.split(".").pop();
-          if (param.name === oldLeaf) {
-            let name = sanitizeName(newLeaf, param.name);
-            let i = 2;
-            while (node.params.some((p) => p !== param && p.name === name)) {
-              name = `${sanitizeName(newLeaf, "param")}${i}`;
-              i += 1;
-            }
-            param.name = name;
-            if (!isUnaryFilter(param.func)) {
-              param.value = defaultParamValue(param.type);
-            }
-          }
-          renderNodes();
-          refreshQuery();
-        });
         removeBtn.addEventListener("click", () => {
+          const removed = param.name;
           node.params = node.params.filter((p) => p.id !== param.id);
+          const clearRef = (group) => {
+            (group?.conditions || []).forEach((c) => {
+              if (c.valueMode === "param" && c.paramName === removed) {
+                c.paramName = "";
+              }
+            });
+          };
+          clearRef(node.rootFilter);
+          Object.values(node.edgeFilters || {}).forEach(clearRef);
           renderNodes();
           refreshQuery();
+        });
+      });
+
+      const getFilterGroup = (edgePath) => {
+        if (!edgePath) {
+          if (!node.rootFilter) node.rootFilter = emptyFilterGroup();
+          return node.rootFilter;
+        }
+        if (!node.edgeFilters) node.edgeFilters = {};
+        if (!node.edgeFilters[edgePath]) node.edgeFilters[edgePath] = emptyFilterGroup();
+        return node.edgeFilters[edgePath];
+      };
+
+      el.querySelectorAll(".filter-panel").forEach((panel) => {
+        const edgePath = panel.dataset.edgePath || "";
+        const group = getFilterGroup(edgePath);
+        const typeName = typeAtEdgePath(node.type, edgePath);
+
+        panel.querySelectorAll(".filter-op-btn").forEach((btn) => {
+          stopDragPropagation(btn);
+          btn.addEventListener("click", () => {
+            group.op = btn.dataset.op === "OR" ? "OR" : "AND";
+            renderNodes();
+            refreshQuery();
+          });
+        });
+
+        panel.querySelector(".add-filter")?.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const preds = scalarPredicates(typeName);
+          const used = new Set(group.conditions.map((c) => c.predicate));
+          const next = preds.find((p) => !used.has(p.name)) || preds[0];
+          const predName = next?.name || "";
+          const type = paramTypeForPredicate(typeName, predName);
+          group.conditions.push(newFilterCondition(predName, type));
+          renderNodes();
+          refreshQuery();
+        });
+
+        panel.querySelectorAll(".filter-row").forEach((row) => {
+          const cond = group.conditions.find((c) => c.id === row.dataset.filterId);
+          if (!cond) return;
+
+          const funcEl = row.querySelector(".filter-func");
+          const predEl = row.querySelector(".filter-predicate");
+          const modeEl = row.querySelector(".filter-value-mode");
+          const literalEl = row.querySelector(".filter-literal");
+          const paramEl = row.querySelector(".filter-param");
+          const removeBtn = row.querySelector(".filter-remove");
+
+          [funcEl, predEl, modeEl, literalEl, paramEl, removeBtn]
+            .filter(Boolean)
+            .forEach(stopDragPropagation);
+
+          funcEl?.addEventListener("change", () => {
+            cond.func = funcEl.value;
+            if (isUnaryFilter(cond.func)) {
+              cond.valueMode = "literal";
+              cond.literal = "";
+              cond.paramName = "";
+            }
+            renderNodes();
+            refreshQuery();
+          });
+          predEl?.addEventListener("change", () => {
+            cond.predicate = predEl.value;
+            const type = paramTypeForPredicate(typeName, cond.predicate);
+            if (cond.valueMode === "literal" && !isUnaryFilter(cond.func)) {
+              cond.literal = defaultParamValue(type);
+            }
+            refreshQuery();
+          });
+          modeEl?.addEventListener("change", () => {
+            cond.valueMode = modeEl.value === "param" ? "param" : "literal";
+            if (cond.valueMode === "param") {
+              if (!cond.paramName && node.params[0]) cond.paramName = node.params[0].name;
+              if (!cond.paramName) {
+                // Auto-create a param from the predicate leaf.
+                const seed = sanitizeName(
+                  (cond.predicate || "param").replace(/\./g, "_"),
+                  "param"
+                );
+                let name = seed;
+                let i = 2;
+                while (node.params.some((p) => p.name === name)) {
+                  name = `${seed}${i}`;
+                  i += 1;
+                }
+                const type = paramTypeForPredicate(typeName, cond.predicate);
+                node.params.push({
+                  id: paramUid(),
+                  name,
+                  type,
+                  value: defaultParamValue(type),
+                  mode: "var",
+                });
+                cond.paramName = name;
+              }
+            }
+            renderNodes();
+            refreshQuery();
+          });
+          literalEl?.addEventListener("input", () => {
+            cond.literal = literalEl.value;
+            refreshQuery();
+          });
+          paramEl?.addEventListener("change", () => {
+            cond.paramName = paramEl.value;
+            refreshQuery();
+          });
+          removeBtn?.addEventListener("click", () => {
+            group.conditions = group.conditions.filter((c) => c.id !== cond.id);
+            if (edgePath && !group.conditions.length) {
+              delete node.edgeFilters[edgePath];
+            }
+            renderNodes();
+            refreshQuery();
+          });
         });
       });
 
@@ -1100,7 +1400,6 @@
 
           if (input.checked) {
             if (kind === "object") {
-              // Expand the edge with no nested fields pre-selected.
               current.selection = setAtPath(current.selection, path, {});
             } else {
               current.selection = setAtPath(current.selection, path, null);
@@ -1108,19 +1407,17 @@
           } else {
             current.selection = setAtPath(current.selection, path, undefined);
             const pathStr = pathKey(path);
-            // Drop aliases for the removed field and anything under it.
             Object.keys(current.aliases || {}).forEach((key) => {
               if (key === pathStr || key.startsWith(`${pathStr}.`)) {
                 delete current.aliases[key];
               }
             });
-            // Drop params whose filter target lived under the removed edge.
-            if (kind === "object") {
-              const prefix = `${pathStr}.`;
-              current.params = current.params.filter(
-                (p) => !p.predicate.startsWith(prefix)
-              );
-            }
+            // Drop edge filters on this edge and anything nested under it.
+            Object.keys(current.edgeFilters || {}).forEach((key) => {
+              if (key === pathStr || key.startsWith(`${pathStr}.`)) {
+                delete current.edgeFilters[key];
+              }
+            });
           }
           renderNodes();
           refreshQuery();
@@ -1158,6 +1455,8 @@
       y: Math.max(8, y),
       selection: defaultSelection(typeName),
       params: [],
+      rootFilter: emptyFilterGroup(),
+      edgeFilters: {},
       directives: { cascade: false, normalize: false },
       aliases: {},
       resultName: "",
@@ -1177,7 +1476,7 @@
     return selection && typeof selection === "object" && Object.keys(selection).length > 0;
   }
 
-  function renderSelection(typeName, selection, depth, edgeFilters, pathPrefix, aliases) {
+  function renderSelection(typeName, selection, depth, node, pathPrefix, aliases) {
     const def = schema[typeName];
     if (!def || !hasAnySelection(selection)) return "";
 
@@ -1193,12 +1492,13 @@
         return;
       }
 
-      const conditions = edgeFilters.get(fieldPath);
-      const filterStr =
-        conditions && conditions.length ? ` @filter(${conditions.join(" AND ")})` : "";
+      const nestedType = field.ofType;
+      const filterStr = formatFilterDirective(
+        node.edgeFilters?.[fieldPath],
+        nestedType || typeName
+      );
 
       const nestedSel = selection[field.name];
-      const nestedType = field.ofType;
 
       // Depth cap only — allow the same type to reappear on a nested edge
       // (e.g. User → posts → author → User) so long as the selection is finite.
@@ -1212,7 +1512,7 @@
         nestedType,
         nestedSel && typeof nestedSel === "object" ? nestedSel : {},
         depth + 1,
-        edgeFilters,
+        node,
         fieldPath,
         aliases
       );
@@ -1284,36 +1584,28 @@
     return String(param.value ?? "");
   }
 
-  /**
-   * Group filter conditions by the edge they apply to.
-   * Key "" is the root function; "posts" or "posts.comments" are nested edges.
-   */
-  function collectConditions(node) {
-    const byPath = new Map();
-    (node.params || [])
-      .filter((p) => p.func && p.predicate)
-      .forEach((p) => {
-        const walk = splitPredicatePath(node.type, p.predicate) || {
-          edgeParts: [],
-          leaf: p.predicate,
-          edgePath: "",
-        };
-        const leaf = walk.leaf;
-        const edgePath = walk.edgePath;
-        let condition;
-        if (isUnaryFilter(p.func)) {
-          condition = `${p.func}(${leaf})`;
-        } else {
-          const valuePart =
-            p.mode === "literal"
-              ? formatDqlLiteral(p)
-              : `$${sanitizeName(p.name, "param")}`;
-          condition = `${p.func}(${leaf}, ${valuePart})`;
-        }
-        if (!byPath.has(edgePath)) byPath.set(edgePath, []);
-        byPath.get(edgePath).push(condition);
-      });
-    return byPath;
+  function formatFilterCondition(cond, typeName) {
+    if (!cond?.func || !cond?.predicate) return null;
+    if (isUnaryFilter(cond.func)) return `${cond.func}(${cond.predicate})`;
+
+    if (cond.valueMode === "param") {
+      const name = sanitizeName(cond.paramName, "");
+      if (!name) return null;
+      return `${cond.func}(${cond.predicate}, $${name})`;
+    }
+
+    const type = paramTypeForPredicate(typeName, cond.predicate);
+    const valuePart = formatDqlLiteral({ type, value: cond.literal });
+    return `${cond.func}(${cond.predicate}, ${valuePart})`;
+  }
+
+  function formatFilterDirective(group, typeName) {
+    const g = ensureFilterGroup(group);
+    const parts = g.conditions
+      .map((c) => formatFilterCondition(c, typeName))
+      .filter(Boolean);
+    if (!parts.length) return "";
+    return ` @filter(${parts.join(` ${g.op} `)})`;
   }
 
   /**
@@ -1333,7 +1625,6 @@
     const seen = new Set();
     const result = [];
     (node.params || []).forEach((param) => {
-      if (param.mode === "literal") return;
       const name = sanitizeName(param.name, "");
       if (!name || seen.has(name)) return;
       seen.add(name);
@@ -1358,11 +1649,7 @@
 
       // One named operation per canvas block, each with its own signature.
       const operations = roots.map((node, i) => {
-        const byPath = collectConditions(node);
-        const rootConditions = byPath.get("") || [];
-        const filter = rootConditions.length
-          ? ` @filter(${rootConditions.join(" AND ")})`
-          : "";
+        const filter = formatFilterDirective(node.rootFilter, node.type);
         const directives =
           (node.directives?.cascade ? " @cascade" : "") +
           (node.directives?.normalize ? " @normalize" : "");
@@ -1370,7 +1657,7 @@
           node.type,
           node.selection,
           2,
-          byPath,
+          node,
           "",
           node.aliases || {}
         );
@@ -1533,6 +1820,25 @@
     drafts.forEach((draft, i) => {
       const col = i % 3;
       const row = Math.floor(i / 3);
+      const withIds = (group) => {
+        const g = ensureFilterGroup(group);
+        return {
+          op: g.op,
+          conditions: g.conditions.map((c) => ({
+            id: filterUid(),
+            func: c.func || "eq",
+            predicate: c.predicate || "",
+            valueMode: c.valueMode === "param" ? "param" : "literal",
+            literal: c.literal ?? "",
+            paramName: c.paramName || "",
+          })),
+        };
+      };
+      const edgeFilters = {};
+      Object.entries(draft.edgeFilters || {}).forEach(([key, group]) => {
+        edgeFilters[key] = withIds(group);
+      });
+
       nodes.push({
         id: uid(),
         type: draft.type,
@@ -1543,12 +1849,12 @@
         params: (draft.params || []).map((p) => ({
           id: paramUid(),
           name: p.name,
-          type: p.type,
-          value: p.value,
-          func: p.func || "",
-          predicate: p.predicate || "",
-          mode: p.mode || "var",
+          type: PARAM_TYPES.includes(p.type) ? p.type : "string",
+          value: p.value ?? "",
+          mode: p.mode === "default" ? "default" : "var",
         })),
+        rootFilter: withIds(draft.rootFilter),
+        edgeFilters,
         directives: {
           cascade: !!draft.directives?.cascade,
           normalize: !!draft.directives?.normalize,

@@ -294,22 +294,20 @@ window.DQLQueryParser = (() => {
 
   /**
    * Split `@filter(...)` conditions on top-level AND/OR.
-   * Returns [{ func, predicate, valueRaw, isVar, varName, literal, unary }]
+   * Returns { op: "AND"|"OR", filters: [...] }.
+   * Mixed AND/OR without parentheses is not modeled — OR wins if any OR appears.
    */
   function parseFilterArgs(filterInner) {
     const { parts, sawOr } = splitFilterConnectors(filterInner);
     const filters = parts.map(parseOneFilterCondition).filter(Boolean);
-    if (sawOr && filters.length) {
-      filters[0].sawOr = true;
-    }
-    return filters;
+    return { op: sawOr ? "OR" : "AND", filters };
   }
 
   function parseDirectivesAndFilter(src, i) {
     const result = {
       cascade: false,
       normalize: false,
-      filters: [],
+      filterGroup: null,
       end: i,
     };
     while (true) {
@@ -323,7 +321,14 @@ window.DQLQueryParser = (() => {
       else if (name.value === "filter") {
         i = skipWs(src, i);
         const bal = extractBalanced(src, i, "(", ")");
-        result.filters.push(...parseFilterArgs(bal.inner));
+        const group = parseFilterArgs(bal.inner);
+        // Multiple @filter directives on one block are AND-merged.
+        if (!result.filterGroup) {
+          result.filterGroup = group;
+        } else if (group.filters.length) {
+          result.filterGroup.op = "AND";
+          result.filterGroup.filters = result.filterGroup.filters.concat(group.filters);
+        }
         i = bal.end;
       } else {
         // Unknown directive with optional (...): skip args.
@@ -375,7 +380,7 @@ window.DQLQueryParser = (() => {
       fields.push({
         alias: alias || null,
         name: pred.value,
-        filters: dirs.filters,
+        filterGroup: dirs.filterGroup,
         cascade: dirs.cascade,
         normalize: dirs.normalize,
         children,
@@ -414,7 +419,7 @@ window.DQLQueryParser = (() => {
       typeName,
       cascade: dirs.cascade,
       normalize: dirs.normalize,
-      filters: dirs.filters,
+      filterGroup: dirs.filterGroup,
       selection: parseSelection(sel.inner),
     };
   }
@@ -620,23 +625,7 @@ window.DQLQueryParser = (() => {
       ensureType(op.typeName);
       (op.selection || []).forEach((f) => ensureField(op.typeName, f, ""));
 
-      let notedOr = false;
-      const noteOr = (filters) => {
-        if (!notedOr && filters?.some((f) => f.sawOr)) {
-          notedOr = true;
-          warnings.push(
-            `OR in @filter was flattened to AND (canvas edits filters as AND only)`
-          );
-        }
-      };
-      noteOr(op.filters);
-      const walkSel = (fields) => {
-        (fields || []).forEach((f) => {
-          noteOr(f.filters);
-          if (f.children) walkSel(f.children);
-        });
-      };
-      walkSel(op.selection);
+      // Filter groups (AND/OR) are preserved on the canvas; nothing to warn about.
     });
 
     return { schema: next, warnings };
@@ -665,89 +654,99 @@ window.DQLQueryParser = (() => {
       const aliases = {};
       const params = [];
       const paramByName = new Map();
+      const rootFilter = { op: "AND", conditions: [] };
+      const edgeFilters = {};
 
       (op.params || []).forEach((p) => {
         const entry = {
           name: p.name,
           type: PARAM_TYPES.includes(p.type) ? p.type : "string",
           value: p.value ?? "",
-          func: "",
-          predicate: "",
-          mode: p.mode || "var",
+          mode: p.mode === "default" ? "default" : "var",
         };
         params.push(entry);
         paramByName.set(p.name, entry);
       });
 
-      function addFilter(edgePath, filter) {
-        // Resolve the edge's type via longest-match path splitting (namespaced preds).
-        let typeName = op.typeName;
-        if (edgePath) {
-          const edgeWalk = splitPredicatePath(schema, op.typeName, edgePath);
-          if (edgeWalk) {
-            for (const edge of edgeWalk.edgeParts) {
-              const f = findField(schema[typeName], edge);
-              if (!f?.ofType) break;
-              typeName = f.ofType;
-            }
-            // edgePath itself may be a single object field (no further leaf edges).
-            const edgeField = findField(schema[typeName], edgeWalk.leaf);
-            if (edgeField?.ofType) typeName = edgeField.ofType;
-          }
+      function ensureParam(name, type, value) {
+        let entry = paramByName.get(name);
+        if (!entry) {
+          entry = {
+            name,
+            type: PARAM_TYPES.includes(type) ? type : "string",
+            value: value ?? "",
+            mode: "var",
+          };
+          params.push(entry);
+          paramByName.set(name, entry);
+        } else if (entry.type === "string" && type && type !== "string") {
+          entry.type = type;
         }
-
-        const leafField = findField(schema[typeName], filter.predicate);
-        const leaf = leafField?.name || filter.predicate;
-        const predicatePath = edgePath ? `${edgePath}.${leaf}` : leaf;
-
-        const schemaType = resolveFieldType(op.typeName, predicatePath);
-        const literalType =
-          filter.literal != null ? inferTypeFromLiteral(filter.valueRaw || filter.literal) : null;
-        const inferredType = schemaType || literalType || "string";
-        const nameSeed = leaf.replace(/\./g, "_");
-
-        if (filter.isVar && filter.varName) {
-          let entry = paramByName.get(filter.varName);
-          if (!entry) {
-            entry = {
-              name: filter.varName,
-              type: inferredType,
-              value: "",
-              func: filter.func,
-              predicate: predicatePath,
-              mode: "var",
-            };
-            params.push(entry);
-            paramByName.set(filter.varName, entry);
-          } else {
-            entry.func = filter.func;
-            entry.predicate = predicatePath;
-            if (entry.type === "string" && inferredType !== "string") {
-              entry.type = inferredType;
-            }
-          }
-        } else if (filter.unary) {
-          params.push({
-            name: nameSeed,
-            type: inferredType,
-            value: "",
-            func: filter.func,
-            predicate: predicatePath,
-            mode: "literal",
-          });
-        } else {
-          params.push({
-            name: nameSeed,
-            type: inferredType,
-            value: filter.literal ?? "",
-            func: filter.func,
-            predicate: predicatePath,
-            mode: "literal",
-          });
-        }
+        return entry;
       }
 
-      (op.filters || []).forEach((f) => addFilter("", f));
+      function resolveEdgeType(edgePath) {
+        let typeName = op.typeName;
+        if (!edgePath) return typeName;
+        const edgeWalk = splitPredicatePath(schema, op.typeName, edgePath);
+        if (!edgeWalk) return typeName;
+        for (const edge of edgeWalk.edgeParts) {
+          const f = findField(schema[typeName], edge);
+          if (!f?.ofType) break;
+          typeName = f.ofType;
+        }
+        const edgeField = findField(schema[typeName], edgeWalk.leaf);
+        if (edgeField?.ofType) typeName = edgeField.ofType;
+        return typeName;
+      }
+
+      function ingestFilterGroup(edgePath, group) {
+        if (!group?.filters?.length) return;
+        const typeName = resolveEdgeType(edgePath);
+        const target = edgePath
+          ? (edgeFilters[edgePath] || (edgeFilters[edgePath] = { op: group.op || "AND", conditions: [] }))
+          : rootFilter;
+        if (edgePath) target.op = group.op || target.op || "AND";
+        else rootFilter.op = group.op || rootFilter.op || "AND";
+
+        group.filters.forEach((filter) => {
+          const leafField = findField(schema[typeName], filter.predicate);
+          const leaf = leafField?.name || filter.predicate;
+          const schemaType = resolveFieldType(
+            op.typeName,
+            edgePath ? `${edgePath}.${leaf}` : leaf
+          );
+          const literalType =
+            filter.literal != null
+              ? inferTypeFromLiteral(filter.valueRaw || filter.literal)
+              : null;
+          const inferredType = schemaType || literalType || "string";
+
+          const cond = {
+            func: filter.func,
+            predicate: leaf,
+            valueMode: "literal",
+            literal: "",
+            paramName: "",
+          };
+
+          if (filter.unary) {
+            cond.valueMode = "literal";
+            cond.literal = "";
+          } else if (filter.isVar && filter.varName) {
+            ensureParam(filter.varName, inferredType, "");
+            cond.valueMode = "param";
+            cond.paramName = filter.varName;
+          } else {
+            cond.valueMode = "literal";
+            cond.literal = filter.literal ?? "";
+          }
+
+          target.conditions.push(cond);
+        });
+      }
+
+      ingestFilterGroup("", op.filterGroup);
 
       function buildSelection(typeName, fieldAsts, pathPrefix) {
         const selection = {};
@@ -755,7 +754,7 @@ window.DQLQueryParser = (() => {
           const name = f.schemaName || findField(schema[typeName], f.name)?.name || f.name;
           const path = pathPrefix ? `${pathPrefix}.${name}` : name;
           if (f.alias) aliases[path] = f.alias;
-          (f.filters || []).forEach((flt) => addFilter(path, flt));
+          if (f.filterGroup) ingestFilterGroup(path, f.filterGroup);
 
           if (f.children) {
             const field = findField(schema[typeName], name);
@@ -774,8 +773,6 @@ window.DQLQueryParser = (() => {
       let resultName = op.resultName || "";
       const derived = /^get./i.test(op.opName) ? op.opName.slice(3) : op.opName;
       if (resultName === derived || resultName === op.typeName) {
-        // Keep explicit when it matches type but would also be the default — still fine empty
-        // if derived === typeName (getUser → User).
         if (resultName === derived) resultName = "";
       }
 
@@ -786,6 +783,8 @@ window.DQLQueryParser = (() => {
         selection,
         aliases,
         params,
+        rootFilter,
+        edgeFilters,
         directives: {
           cascade: !!op.cascade,
           normalize: !!op.normalize,
