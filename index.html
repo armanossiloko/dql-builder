@@ -48,13 +48,19 @@
         <div class="panel-label">
           <span>Canvas</span>
           <div class="panel-actions">
+            <div class="entity-menu" id="entityMenuWrap">
+              <button type="button" id="addEntityBtn" class="btn-ghost btn-add-entity" aria-haspopup="true" aria-expanded="false">
+                + Add entity
+              </button>
+              <div id="entityMenu" class="entity-menu-panel" hidden role="menu" aria-label="Add entity"></div>
+            </div>
             <button type="button" id="clearBtn" class="btn-ghost">Clear</button>
           </div>
         </div>
         <div id="canvas" class="canvas" tabindex="0">
-          <nav id="entityDock" class="entity-dock" aria-label="Add entities"></nav>
+          <div id="canvasSurface" class="canvas-surface" aria-hidden="true"></div>
           <div class="canvas-empty" id="canvasEmpty">
-            Edit DQL on the left, or click / drag an entity from the dock.
+            Edit DQL on the left, or add an entity from the menu above.
           </div>
         </div>
         <section class="builder-console" id="builderConsole" aria-label="Builder console">

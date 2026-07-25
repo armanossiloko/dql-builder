@@ -23,9 +23,12 @@
     return f === "has";
   }
 
-  const dockEl = document.getElementById("entityDock");
   const canvasEl = document.getElementById("canvas");
+  const canvasSurfaceEl = document.getElementById("canvasSurface");
   const canvasEmptyEl = document.getElementById("canvasEmpty");
+  const addEntityBtn = document.getElementById("addEntityBtn");
+  const entityMenuEl = document.getElementById("entityMenu");
+  const entityMenuWrap = document.getElementById("entityMenuWrap");
   const copyBtn = document.getElementById("copyBtn");
   const copyVarsBtn = document.getElementById("copyVarsBtn");
   const clearBtn = document.getElementById("clearBtn");
@@ -61,6 +64,8 @@
   let dragPaletteType = null;
   /** @type {{ id: string, offsetX: number, offsetY: number } | null} */
   let moveState = null;
+  /** @type {{ id: string, startX: number, startY: number, startW: number, startH: number } | null} */
+  let resizeState = null;
   let selectedNodeId = null;
   let nodeSeq = 0;
   let paramSeq = 0;
@@ -140,6 +145,7 @@
           });
         });
       });
+      resolveOverlaps();
       return true;
     } catch {
       return false;
@@ -515,6 +521,8 @@
     });
 
     node.params = kept;
+    if (node.width != null) node.width = Math.max(300, Number(node.width) || 380);
+    if (node.height != null) node.height = Math.max(240, Number(node.height) || 520);
     return node;
   }
 
@@ -532,8 +540,17 @@
     return leaf?.ofType || typeName;
   }
 
+  function fieldDisplayName(name) {
+    const raw = String(name || "");
+    const i = raw.lastIndexOf(".");
+    return i >= 0 ? raw.slice(i + 1) : raw;
+  }
+
   function scalarOptionsForType(typeName) {
-    return scalarPredicates(typeName).map((f) => ({ value: f.name, label: f.name }));
+    return scalarPredicates(typeName).map((f) => ({
+      value: f.name,
+      label: fieldDisplayName(f.name),
+    }));
   }
 
   function defaultName(typeName) {
@@ -667,10 +684,13 @@
    * ("posts.published"). Nested targets produce an @filter on that edge.
    */
   function filterTargets(typeName, selection, prefix = []) {
-    let targets = scalarPredicates(typeName).map((f) => ({
-      value: [...prefix, f.name].join("."),
-      label: [...prefix, f.name].join("."),
-    }));
+    let targets = scalarPredicates(typeName).map((f) => {
+      const parts = [...prefix, f.name];
+      return {
+        value: parts.join("."),
+        label: parts.map(fieldDisplayName).join("."),
+      };
+    });
 
     if (prefix.length >= 6) return targets;
 
@@ -740,11 +760,18 @@
     return path.join(".");
   }
 
+  function escapeAttr(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;");
+  }
+
   function updateEmptyState() {
     canvasEmptyEl.classList.toggle("hidden", nodes.length > 0);
     if (!nodes.length) {
       canvasEmptyEl.textContent =
-        "Edit DQL on the left, or click / drag an entity from the dock.";
+        "Edit DQL on the left, or add an entity from + Add entity above.";
     }
   }
 
@@ -752,13 +779,6 @@
     ["pointerdown", "mousedown", "click"].forEach((evt) => {
       el.addEventListener(evt, (e) => e.stopPropagation());
     });
-  }
-
-  function escapeAttr(value) {
-    return String(value ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/"/g, "&quot;")
-      .replace(/</g, "&lt;");
   }
 
   function getNode(id) {
@@ -773,25 +793,146 @@
     });
   }
 
-  /* ---------- Entity dock ---------- */
+  /* ---------- Entity menu (canvas header) ---------- */
+
+  const DEFAULT_NODE_W = 420;
+  const DEFAULT_NODE_H = 520;
+  const NODE_GAP = 28;
+  const CANVAS_PAD = 48;
+  const CANVAS_MIN_W = 3200;
+  const CANVAS_MIN_H = 2400;
+
+  function estimateNodeSize(node) {
+    return {
+      w: Math.max(300, Number(node.width) || DEFAULT_NODE_W),
+      h: Math.max(220, Number(node.height) || DEFAULT_NODE_H),
+    };
+  }
+
+  function rectsOverlap(a, b, gap = NODE_GAP) {
+    return !(
+      a.x + a.w + gap <= b.x ||
+      b.x + b.w + gap <= a.x ||
+      a.y + a.h + gap <= b.y ||
+      b.y + b.h + gap <= a.y
+    );
+  }
+
+  function findFreePosition(width, height, preferred, excludeId) {
+    const w = width || DEFAULT_NODE_W;
+    const h = height || DEFAULT_NODE_H;
+    const others = nodes
+      .filter((n) => n.id !== excludeId)
+      .map((n) => {
+        const s = estimateNodeSize(n);
+        return { x: n.x, y: n.y, w: s.w, h: s.h };
+      });
+
+    const tryPos = (x, y) => {
+      const cand = { x: Math.max(CANVAS_PAD, x), y: Math.max(CANVAS_PAD, y), w, h };
+      if (!others.some((o) => rectsOverlap(cand, o))) return cand;
+      return null;
+    };
+
+    if (preferred) {
+      const hit = tryPos(preferred.x, preferred.y);
+      if (hit) return hit;
+    }
+
+    // Scan a grid across a generous canvas.
+    const stepX = Math.floor(w + NODE_GAP);
+    const stepY = Math.floor(Math.min(h, 280) + NODE_GAP);
+    for (let row = 0; row < 40; row += 1) {
+      for (let col = 0; col < 24; col += 1) {
+        const hit = tryPos(CANVAS_PAD + col * stepX, CANVAS_PAD + row * stepY);
+        if (hit) return hit;
+      }
+    }
+    return {
+      x: CANVAS_PAD + nodes.length * 24,
+      y: CANVAS_PAD + nodes.length * 24,
+      w,
+      h,
+    };
+  }
+
+  /** Push overlapping cards onto free slots (session restore / imports). */
+  function resolveOverlaps() {
+    nodes.forEach((n) => {
+      const s = estimateNodeSize(n);
+      const self = { x: n.x, y: n.y, w: s.w, h: s.h };
+      const hit = nodes.some((o) => {
+        if (o.id === n.id) return false;
+        const os = estimateNodeSize(o);
+        return rectsOverlap(self, { x: o.x, y: o.y, w: os.w, h: os.h });
+      });
+      if (!hit) return;
+      const pos = findFreePosition(s.w, s.h, null, n.id);
+      n.x = pos.x;
+      n.y = pos.y;
+    });
+  }
+
+  function updateCanvasSurface() {
+    if (!canvasSurfaceEl) return;
+    let maxR = CANVAS_MIN_W;
+    let maxB = CANVAS_MIN_H;
+    nodes.forEach((n) => {
+      const s = estimateNodeSize(n);
+      maxR = Math.max(maxR, n.x + s.w + 600);
+      maxB = Math.max(maxB, n.y + s.h + 600);
+    });
+    // Also account for live DOM sizes when available.
+    canvasEl.querySelectorAll(".entity-node").forEach((el) => {
+      const x = parseFloat(el.style.left) || 0;
+      const y = parseFloat(el.style.top) || 0;
+      maxR = Math.max(maxR, x + el.offsetWidth + 600);
+      maxB = Math.max(maxB, y + el.offsetHeight + 600);
+    });
+    canvasSurfaceEl.style.width = `${Math.ceil(maxR)}px`;
+    canvasSurfaceEl.style.height = `${Math.ceil(maxB)}px`;
+  }
+
+  function closeEntityMenu() {
+    if (!entityMenuEl || !addEntityBtn) return;
+    entityMenuEl.hidden = true;
+    addEntityBtn.setAttribute("aria-expanded", "false");
+  }
+
+  function toggleEntityMenu() {
+    if (!entityMenuEl || !addEntityBtn) return;
+    const open = entityMenuEl.hidden;
+    entityMenuEl.hidden = !open;
+    addEntityBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
 
   function renderDock() {
-    dockEl.innerHTML = '<p class="dock-title">Entities</p>';
+    renderEntityMenu();
+  }
+
+  function renderEntityMenu() {
+    if (!entityMenuEl) return;
+    entityMenuEl.innerHTML = "";
+    const list = document.createElement("div");
+    list.className = "entity-menu-list";
+
     Object.entries(schema).forEach(([typeName, def]) => {
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "dock-item";
+      item.className = "entity-menu-item";
+      item.role = "menuitem";
       item.draggable = true;
       item.dataset.type = typeName;
-      item.title = `Add ${typeName} query block`;
+      item.title = `Add ${typeName} query block — drag onto canvas or click`;
       item.innerHTML = `
         <span class="palette-dot" style="background:${def.color}"></span>
-        <span>${typeName}</span>
-        <span class="dock-add" aria-hidden="true" title='type("${typeName}")'>+</span>
+        <span class="entity-menu-name">${typeName}</span>
+        <span class="entity-menu-hint">+</span>
       `;
       item.addEventListener("click", () => {
-        const count = nodes.length;
-        placeEntity(typeName, 200 + (count % 5) * 30, 30 + (count % 5) * 30);
+        closeEntityMenu();
+        const pos = findFreePosition(DEFAULT_NODE_W, DEFAULT_NODE_H);
+        placeEntity(typeName, pos.x, pos.y);
       });
       item.addEventListener("dragstart", (e) => {
         dragPaletteType = typeName;
@@ -803,8 +944,10 @@
         dragPaletteType = null;
         item.classList.remove("dragging");
       });
-      dockEl.appendChild(item);
+      list.appendChild(item);
     });
+
+    entityMenuEl.appendChild(list);
   }
 
   /* ---------- Query block rendering ---------- */
@@ -912,16 +1055,16 @@
               class="alias-input"
               data-alias-path="${escapeAttr(encodePath(fieldPath))}"
               value="${escapeAttr(aliasValue)}"
-              size="${Math.max(5, Math.min(28, (aliasValue || "alias").length + 1))}"
               placeholder="alias"
               spellcheck="false"
               title="Alias — result key for this predicate"
             />`
-          : `<span class="field-type">${field.type}</span>`;
+          : `<span class="field-type" title="${escapeAttr(field.type)}">${field.type}</span>`;
 
+        const label = fieldDisplayName(field.name);
         return `
           <li>
-            <div class="field-row${objectClass}" style="padding-left:${0.4 + depth * 0.55}rem">
+            <div class="field-row${objectClass}" style="padding-left:${0.35 + depth * 0.4}rem">
               <label class="field-check">
                 <input
                   type="checkbox"
@@ -930,7 +1073,7 @@
                   data-oftype="${field.ofType || ""}"
                   ${checked ? "checked" : ""}
                 />
-                <span class="field-name">${field.name}</span>
+                <span class="field-name" title="${escapeAttr(field.name)}">${escapeAttr(label)}</span>
               </label>
               ${aliasHtml}
             </div>
@@ -1031,9 +1174,9 @@
     const fieldScroll = new Map();
     canvasEl.querySelectorAll(".entity-node").forEach((el) => {
       const id = el.dataset.id;
-      const fields = el.querySelector(".entity-fields");
-      if (id && fields) {
-        fieldScroll.set(id, { top: fields.scrollTop, left: fields.scrollLeft });
+      const body = el.querySelector(".entity-node-body");
+      if (id && body) {
+        fieldScroll.set(id, { top: body.scrollTop, left: body.scrollLeft });
       }
     });
 
@@ -1047,6 +1190,11 @@
       el.style.left = `${node.x}px`;
       el.style.top = `${node.y}px`;
       el.style.zIndex = selectedNodeId === node.id ? "5" : "2";
+      const size = estimateNodeSize(node);
+      el.style.width = `${size.w}px`;
+      el.style.height = `${size.h}px`;
+      if (!node.width) node.width = size.w;
+      if (!node.height) node.height = size.h;
 
       // Pop-in only on first appearance, not on every re-render.
       if (animatedNodes.has(node.id)) el.style.animation = "none";
@@ -1077,10 +1225,13 @@
           </div>
           <button type="button" class="entity-node-remove" title="Remove" aria-label="Remove ${node.type}">×</button>
         </header>
-        ${renderDirectivesSection(node)}
-        ${renderParamsSection(node)}
-        ${renderRootFiltersSection(node)}
-        <ul class="entity-fields">${renderFieldTree(node.type, node.selection, [], 0, node.aliases || {}, node)}</ul>
+        <div class="entity-node-body">
+          ${renderDirectivesSection(node)}
+          ${renderParamsSection(node)}
+          ${renderRootFiltersSection(node)}
+          <ul class="entity-fields">${renderFieldTree(node.type, node.selection, [], 0, node.aliases || {}, node)}</ul>
+        </div>
+        <div class="entity-resize" data-resize-handle title="Drag to resize"></div>
       `;
 
       const header = el.querySelector(".entity-node-header");
@@ -1099,6 +1250,25 @@
         el.classList.add("dragging");
         document.body.classList.add("is-dragging-node");
       });
+
+      const resizeHandle = el.querySelector("[data-resize-handle]");
+      if (resizeHandle) {
+        resizeHandle.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setSelected(node.id);
+          resizeState = {
+            id: node.id,
+            startX: e.clientX,
+            startY: e.clientY,
+            startW: el.offsetWidth,
+            startH: el.offsetHeight,
+          };
+          el.classList.add("resizing");
+          document.body.classList.add("is-resizing-node");
+          resizeHandle.setPointerCapture?.(e.pointerId);
+        });
+      }
 
       stopDragPropagation(nameInput);
       nameInput.addEventListener("input", () => {
@@ -1433,26 +1603,34 @@
 
       const savedScroll = fieldScroll.get(node.id);
       if (savedScroll) {
-        const fields = el.querySelector(".entity-fields");
-        if (fields) {
-          fields.scrollTop = savedScroll.top;
-          fields.scrollLeft = savedScroll.left;
+        const body = el.querySelector(".entity-node-body");
+        if (body) {
+          body.scrollTop = savedScroll.top;
+          body.scrollLeft = savedScroll.left;
         }
       }
     });
 
     updateEmptyState();
+    updateCanvasSurface();
   }
 
   function placeEntity(typeName, x, y) {
     if (!schema[typeName]) return;
 
+    const pos =
+      x != null && y != null
+        ? findFreePosition(DEFAULT_NODE_W, DEFAULT_NODE_H, { x, y })
+        : findFreePosition(DEFAULT_NODE_W, DEFAULT_NODE_H);
+
     nodes.push({
       id: uid(),
       type: typeName,
       name: defaultName(typeName),
-      x: Math.max(8, x),
-      y: Math.max(8, y),
+      x: pos.x,
+      y: pos.y,
+      width: DEFAULT_NODE_W,
+      height: DEFAULT_NODE_H,
       selection: defaultSelection(typeName),
       params: [],
       rootFilter: emptyFilterGroup(),
@@ -1731,6 +1909,20 @@
   /* ---------- Canvas drag & drop ---------- */
 
   window.addEventListener("pointermove", (e) => {
+    if (resizeState) {
+      const node = getNode(resizeState.id);
+      const el = canvasEl.querySelector(`.entity-node[data-id="${resizeState.id}"]`);
+      if (!node || !el) return;
+      const nextW = Math.max(300, resizeState.startW + (e.clientX - resizeState.startX));
+      const nextH = Math.max(240, resizeState.startH + (e.clientY - resizeState.startY));
+      node.width = nextW;
+      node.height = nextH;
+      el.style.width = `${nextW}px`;
+      el.style.height = `${nextH}px`;
+      updateCanvasSurface();
+      return;
+    }
+
     if (!moveState) return;
     const node = getNode(moveState.id);
     const el = canvasEl.querySelector(`.entity-node[data-id="${moveState.id}"]`);
@@ -1738,18 +1930,27 @@
 
     const canvasRect = canvasEl.getBoundingClientRect();
     node.x = Math.max(
-      8,
+      0,
       e.clientX - canvasRect.left - moveState.offsetX + canvasEl.scrollLeft
     );
     node.y = Math.max(
-      8,
+      0,
       e.clientY - canvasRect.top - moveState.offsetY + canvasEl.scrollTop
     );
     el.style.left = `${node.x}px`;
     el.style.top = `${node.y}px`;
+    updateCanvasSurface();
   });
 
   window.addEventListener("pointerup", () => {
+    if (resizeState) {
+      const el = canvasEl.querySelector(`.entity-node[data-id="${resizeState.id}"]`);
+      if (el) el.classList.remove("resizing");
+      document.body.classList.remove("is-resizing-node");
+      resizeState = null;
+      scheduleSaveWorkspace();
+      return;
+    }
     if (!moveState) return;
     const el = canvasEl.querySelector(`.entity-node[data-id="${moveState.id}"]`);
     if (el) el.classList.remove("dragging");
@@ -1773,13 +1974,27 @@
   canvasEl.addEventListener("drop", (e) => {
     e.preventDefault();
     canvasEl.classList.remove("drag-over");
+    closeEntityMenu();
     const typeName = dragPaletteType || e.dataTransfer.getData("text/plain");
     if (!typeName || !schema[typeName]) return;
 
     const rect = canvasEl.getBoundingClientRect();
-    const x = e.clientX - rect.left + canvasEl.scrollLeft - 140;
-    const y = e.clientY - rect.top + canvasEl.scrollTop - 20;
+    const x = e.clientX - rect.left + canvasEl.scrollLeft - DEFAULT_NODE_W / 2;
+    const y = e.clientY - rect.top + canvasEl.scrollTop - 24;
     placeEntity(typeName, x, y);
+  });
+
+  if (addEntityBtn) {
+    addEntityBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleEntityMenu();
+    });
+  }
+  document.addEventListener("click", (e) => {
+    if (!entityMenuWrap?.contains(e.target)) closeEntityMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeEntityMenu();
   });
 
   clearBtn.addEventListener("click", () => {
@@ -1818,8 +2033,6 @@
     animatedNodes.clear();
 
     drafts.forEach((draft, i) => {
-      const col = i % 3;
-      const row = Math.floor(i / 3);
       const withIds = (group) => {
         const g = ensureFilterGroup(group);
         return {
@@ -1839,12 +2052,15 @@
         edgeFilters[key] = withIds(group);
       });
 
+      const pos = findFreePosition(DEFAULT_NODE_W, DEFAULT_NODE_H);
       nodes.push({
         id: uid(),
         type: draft.type,
         name: draft.name,
-        x: 200 + col * 40 + row * 12,
-        y: 36 + row * 48 + col * 10,
+        x: pos.x,
+        y: pos.y,
+        width: DEFAULT_NODE_W,
+        height: DEFAULT_NODE_H,
         selection: draft.selection,
         params: (draft.params || []).map((p) => ({
           id: paramUid(),
@@ -1865,6 +2081,7 @@
     });
 
     if (nodes.length) selectedNodeId = nodes[0].id;
+    resolveOverlaps();
 
     // Clear dirty before refresh so generated DQL can write back into the editor.
     clearDqlDirty();
