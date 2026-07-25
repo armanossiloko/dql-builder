@@ -1,4 +1,4 @@
-# Deploy the static DQL Builder site to GitHub Pages.
+# Deploy the static DQL Builder site to GitHub Pages via Vite.
 #
 # REQUIRED once (workflow cannot do this with GITHUB_TOKEN):
 #   Repo → Settings → Pages → Build and deployment → Source: GitHub Actions
@@ -32,20 +32,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site
+        run: npm run build
+
+      - name: Add .nojekyll
+        run: touch dist/.nojekyll
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
-
-      - name: Prepare site files
-        run: |
-          mkdir _site
-          cp index.html styles.css app.js schema.js schema-loader.js query-parser.js _site/
-          # Optional: keep Jekyll from touching the publish dir if GitHub ever runs it
-          touch _site/.nojekyll
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: dist
 
       - name: Deploy to GitHub Pages
         id: deployment

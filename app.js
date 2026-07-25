@@ -60,6 +60,73 @@
   let nodeSeq = 0;
   let paramSeq = 0;
   const animatedNodes = new Set();
+  /** True when `schema` came from the built-in sample (reload picks up schema.js edits). */
+  let schemaIsSample = true;
+
+  /* ---------- Dev workspace persistence (survives Vite live reload) ---------- */
+
+  const WORKSPACE_KEY = "dql-builder:workspace:v1";
+  let saveWorkspaceTimer = null;
+
+  function saveWorkspace() {
+    try {
+      sessionStorage.setItem(
+        WORKSPACE_KEY,
+        JSON.stringify({
+          schemaIsSample,
+          schema: schemaIsSample ? null : schema,
+          nodes,
+          selectedNodeId,
+          nodeSeq,
+          paramSeq,
+        })
+      );
+    } catch {
+      /* quota / private mode */
+    }
+  }
+
+  function scheduleSaveWorkspace() {
+    clearTimeout(saveWorkspaceTimer);
+    saveWorkspaceTimer = setTimeout(saveWorkspace, 120);
+  }
+
+  function clearWorkspace() {
+    clearTimeout(saveWorkspaceTimer);
+    try {
+      sessionStorage.removeItem(WORKSPACE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function restoreWorkspace() {
+    try {
+      const raw = sessionStorage.getItem(WORKSPACE_KEY);
+      if (!raw) return false;
+      const data = JSON.parse(raw);
+      if (!data || !Array.isArray(data.nodes)) return false;
+
+      if (data.schemaIsSample) {
+        schema = window.DQL_SCHEMA;
+        schemaIsSample = true;
+      } else if (data.schema && typeof data.schema === "object") {
+        schema = data.schema;
+        schemaIsSample = false;
+      } else {
+        return false;
+      }
+
+      nodes = data.nodes;
+      selectedNodeId = data.selectedNodeId || null;
+      nodeSeq = Number(data.nodeSeq) || nodes.length;
+      paramSeq = Number(data.paramSeq) || 0;
+      nodes.forEach((n) => animatedNodes.add(n.id));
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   /* ---------- Output (Monaco with textarea fallback) ---------- */
 
@@ -1353,6 +1420,8 @@
     } catch (err) {
       consoleError(err.message || String(err), "query-build");
       setOutputs(`# Query build failed:\n# ${err.message || err}`, "");
+    } finally {
+      scheduleSaveWorkspace();
     }
   }
 
@@ -1399,6 +1468,7 @@
     if (el) el.classList.remove("dragging");
     document.body.classList.remove("is-dragging-node");
     moveState = null;
+    scheduleSaveWorkspace();
   });
 
   canvasEl.addEventListener("dragover", (e) => {
@@ -1429,6 +1499,7 @@
     nodes = [];
     selectedNodeId = null;
     clearDqlDirty();
+    clearWorkspace();
     renderNodes();
     refreshQuery();
   });
@@ -1454,6 +1525,7 @@
     const drafts = window.DQLQueryParser.toNodes(operations, nextSchema);
 
     schema = nextSchema;
+    schemaIsSample = false;
     nodes = [];
     selectedNodeId = null;
     animatedNodes.clear();
@@ -1599,8 +1671,9 @@
   }
 
   /** Swap the active schema and reset the canvas (blocks reference old types). */
-  function setSchema(next) {
+  function setSchema(next, { isSample = false } = {}) {
     schema = next;
+    schemaIsSample = isSample;
     nodes = [];
     selectedNodeId = null;
     animatedNodes.clear();
@@ -1617,7 +1690,7 @@
       consoleError("Schema parsed, but it contains no usable object types.", "schema");
       return;
     }
-    setSchema(next);
+    setSchema(next, { isSample: false });
     setSchemaStatus(`Loaded ${count} entit${count === 1 ? "y" : "ies"} from ${sourceLabel}.`, "ok");
     consoleInfo(`Loaded ${count} entit${count === 1 ? "y" : "ies"} from ${sourceLabel}`, "schema");
   }
@@ -1680,15 +1753,21 @@
   });
 
   schemaSampleBtn.addEventListener("click", () => {
-    setSchema(window.DQL_SCHEMA);
+    setSchema(window.DQL_SCHEMA, { isSample: true });
     setSchemaStatus("Restored the built-in sample schema.", "ok");
     consoleInfo("Restored the built-in sample schema", "schema");
   });
 
   /* ---------- Init ---------- */
 
+  const restored = restoreWorkspace();
   renderDock();
-  updateEmptyState();
+  if (restored) {
+    renderNodes();
+    consoleInfo("Restored canvas from previous session", "workspace");
+  } else {
+    updateEmptyState();
+  }
   initEditors();
   refreshQuery();
 })();
