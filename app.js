@@ -638,12 +638,14 @@
           `;
         }
 
+        const aliasValue = aliases[key] || "";
         const aliasHtml = checked
           ? `<input
               type="text"
               class="alias-input"
               data-alias-path="${escapeAttr(encodePath(fieldPath))}"
-              value="${escapeAttr(aliases[key] || "")}"
+              value="${escapeAttr(aliasValue)}"
+              size="${Math.max(5, Math.min(28, (aliasValue || "alias").length + 1))}"
               placeholder="alias"
               spellcheck="false"
               title="Alias — result key for this predicate"
@@ -755,6 +757,17 @@
   }
 
   function renderNodes() {
+    // Full re-render replaces the DOM — keep field-list scroll so toggling
+    // a property near the bottom doesn't jump back to the top.
+    const fieldScroll = new Map();
+    canvasEl.querySelectorAll(".entity-node").forEach((el) => {
+      const id = el.dataset.id;
+      const fields = el.querySelector(".entity-fields");
+      if (id && fields) {
+        fieldScroll.set(id, { top: fields.scrollTop, left: fields.scrollLeft });
+      }
+    });
+
     canvasEl.querySelectorAll(".entity-node").forEach((el) => el.remove());
 
     nodes.forEach((node) => {
@@ -858,11 +871,17 @@
 
       el.querySelectorAll(".alias-input").forEach((input) => {
         stopDragPropagation(input);
+        const syncAliasSize = () => {
+          const len = Math.max(5, Math.min(28, (input.value || "alias").length + 1));
+          input.size = len;
+        };
+        syncAliasSize();
         input.addEventListener("input", () => {
           const key = pathKey(decodePath(input.dataset.aliasPath));
           const value = input.value.trim();
           if (value) node.aliases[key] = value;
           else delete node.aliases[key];
+          syncAliasSize();
           refreshQuery();
         });
         input.addEventListener("change", () => {
@@ -871,6 +890,7 @@
             // Aliases may be dotted (Author.Name), so keep dots.
             node.aliases[key] = node.aliases[key].replace(/[^A-Za-z0-9_.]/g, "_");
             input.value = node.aliases[key];
+            syncAliasSize();
             refreshQuery();
           }
         });
@@ -1046,6 +1066,15 @@
       });
 
       canvasEl.appendChild(el);
+
+      const savedScroll = fieldScroll.get(node.id);
+      if (savedScroll) {
+        const fields = el.querySelector(".entity-fields");
+        if (fields) {
+          fields.scrollTop = savedScroll.top;
+          fields.scrollLeft = savedScroll.left;
+        }
+      }
     });
 
     updateEmptyState();
