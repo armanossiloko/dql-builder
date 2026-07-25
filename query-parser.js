@@ -451,24 +451,101 @@ window.DQLQueryParser = (() => {
 
   /** Guess a nested type name from an edge when the schema has no binding. */
   function guessNestedType(edgeName, parentType, schema) {
-    let base = edgeName;
+    let base = String(edgeName || "");
+    if (base.includes(".")) base = base.split(".").pop();
     if (/ies$/i.test(base)) base = `${base.slice(0, -3)}y`;
     else if (/ses$/i.test(base)) base = base.slice(0, -2);
     else if (/s$/i.test(base) && !/ss$/i.test(base)) base = base.slice(0, -1);
     base = base.charAt(0).toUpperCase() + base.slice(1);
     if (schema[base] && base !== parentType) return base;
     if (base === parentType) return `${parentType}_${edgeName}`;
-    // Prefer an unused name; if taken by something unrelated, namespace.
+    // Prefer an unused name; if taken by something unrelated, rename.
     if (!schema[base]) return base;
     return `${parentType}_${edgeName}`;
   }
 
+  /**
+   * Resolve a field on a type. Prefer exact predicate names (including dots
+   * like "User.name"). Short DQL names uniquely match a namespaced schema
+   * field ("name" → "User.name") so we keep the schema's real predicate.
+   */
   function findField(typeDef, predName) {
     if (!typeDef) return null;
-    const exact = typeDef.fields.find((f) => f.name === predName);
+    const fields = typeDef.fields || [];
+    const exact = fields.find((f) => f.name === predName);
     if (exact) return exact;
-    const leaf = predName.includes(".") ? predName.split(".").pop() : predName;
-    return typeDef.fields.find((f) => f.name === leaf) || null;
+
+    // "name" → unique "User.name" (do not invent short aliases for dotted preds).
+    if (predName && !String(predName).includes(".")) {
+      const matches = fields.filter((f) => f.name.endsWith(`.${predName}`));
+      if (matches.length === 1) return matches[0];
+    }
+    return null;
+  }
+
+  /**
+   * Split a dotted path into edge parts + leaf, matching longest schema field
+   * names at each step so "User.posts.Post.title" stays intact.
+   */
+  function splitPredicatePath(schema, typeName, pathStr) {
+    const raw = String(pathStr || "");
+    if (!raw) return null;
+
+    const fieldsAt = (t) => schema[t]?.fields || [];
+    if (fieldsAt(typeName).some((f) => f.name === raw)) {
+      return { edgeParts: [], leaf: raw, edgePath: "" };
+    }
+
+    const segments = raw.split(".");
+    const edgeParts = [];
+    let currentType = typeName;
+    let i = 0;
+
+    while (i < segments.length) {
+      const fields = fieldsAt(currentType);
+      let matched = null;
+      let matchedEnd = -1;
+      for (let j = segments.length; j > i; j -= 1) {
+        const candidate = segments.slice(i, j).join(".");
+        const field = fields.find((f) => f.name === candidate);
+        if (field) {
+          matched = field;
+          matchedEnd = j;
+          break;
+        }
+      }
+
+      if (!matched) {
+        const rest = segments.slice(i).join(".");
+        const short = findField({ fields }, rest);
+        return {
+          edgeParts,
+          leaf: short?.name || rest,
+          edgePath: edgeParts.join("."),
+        };
+      }
+
+      const start = i;
+      i = matchedEnd;
+
+      if (i >= segments.length) {
+        return { edgeParts, leaf: matched.name, edgePath: edgeParts.join(".") };
+      }
+
+      if (matched.kind === "object" && matched.ofType) {
+        edgeParts.push(matched.name);
+        currentType = matched.ofType;
+        continue;
+      }
+
+      return {
+        edgeParts,
+        leaf: segments.slice(start).join("."),
+        edgePath: edgeParts.join("."),
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -571,18 +648,17 @@ window.DQLQueryParser = (() => {
    */
   function toNodes(operations, schema) {
     function resolveFieldType(rootType, predicatePath) {
-      const parts = String(predicatePath || "").split(".").filter(Boolean);
+      const walk = splitPredicatePath(schema, rootType, predicatePath);
+      if (!walk) return null;
       let typeName = rootType;
-      for (let i = 0; i < parts.length; i += 1) {
-        const field = findField(schema[typeName], parts[i]);
-        if (!field) return null;
-        if (i === parts.length - 1) {
-          return PARAM_TYPES.includes(field.type) ? field.type : null;
-        }
-        if (!field.ofType) return null;
+      for (const edge of walk.edgeParts) {
+        const field = findField(schema[typeName], edge);
+        if (!field?.ofType) return null;
         typeName = field.ofType;
       }
-      return null;
+      const field = findField(schema[typeName], walk.leaf);
+      if (!field) return null;
+      return PARAM_TYPES.includes(field.type) ? field.type : null;
     }
 
     return operations.map((op) => {
@@ -604,30 +680,31 @@ window.DQLQueryParser = (() => {
       });
 
       function addFilter(edgePath, filter) {
-        const leaf = filter.predicate.includes(".")
-          ? filter.predicate.split(".").pop()
-          : filter.predicate;
-        // Prefer matching a real schema field on the edge's type.
-        let predicatePath = edgePath ? `${edgePath}.${leaf}` : leaf;
-
-        // Try to resolve against schema for exact / namespaced names.
-        const walk = edgePath ? edgePath.split(".") : [];
+        // Resolve the edge's type via longest-match path splitting (namespaced preds).
         let typeName = op.typeName;
-        for (const part of walk) {
-          const f = findField(schema[typeName], part);
-          if (!f?.ofType) break;
-          typeName = f.ofType;
+        if (edgePath) {
+          const edgeWalk = splitPredicatePath(schema, op.typeName, edgePath);
+          if (edgeWalk) {
+            for (const edge of edgeWalk.edgeParts) {
+              const f = findField(schema[typeName], edge);
+              if (!f?.ofType) break;
+              typeName = f.ofType;
+            }
+            // edgePath itself may be a single object field (no further leaf edges).
+            const edgeField = findField(schema[typeName], edgeWalk.leaf);
+            if (edgeField?.ofType) typeName = edgeField.ofType;
+          }
         }
+
         const leafField = findField(schema[typeName], filter.predicate);
-        if (leafField) {
-          predicatePath = edgePath ? `${edgePath}.${leafField.name}` : leafField.name;
-        }
+        const leaf = leafField?.name || filter.predicate;
+        const predicatePath = edgePath ? `${edgePath}.${leaf}` : leaf;
 
         const schemaType = resolveFieldType(op.typeName, predicatePath);
         const literalType =
           filter.literal != null ? inferTypeFromLiteral(filter.valueRaw || filter.literal) : null;
         const inferredType = schemaType || literalType || "string";
-        const nameSeed = (leafField?.name || leaf).replace(/\./g, "_");
+        const nameSeed = leaf.replace(/\./g, "_");
 
         if (filter.isVar && filter.varName) {
           let entry = paramByName.get(filter.varName);
