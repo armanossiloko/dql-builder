@@ -25,6 +25,41 @@
       <div class="topbar-actions">
         <span id="schemaLabel" class="schema-label" title="Active schema"></span>
         <button type="button" id="loadSchemaBtn" class="btn">Load schema</button>
+        <div class="help-wrap" id="helpWrap">
+          <button type="button" id="helpBtn" class="btn btn-quiet" aria-expanded="false" aria-controls="helpPanel">Help</button>
+          <div id="helpPanel" class="help-panel" role="dialog" aria-label="Help" hidden>
+            <h2>Shortcuts</h2>
+            <dl class="help-keys">
+              <dt><kbd class="mod-key">Ctrl</kbd>+<kbd>Enter</kbd></dt>
+              <dd>Apply the Query editor to the canvas</dd>
+              <dt><kbd class="mod-key">Ctrl</kbd>+<kbd>Z</kbd></dt>
+              <dd>Undo a canvas change</dd>
+              <dt><kbd class="mod-key">Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></dt>
+              <dd>Redo</dd>
+              <dt><kbd class="mod-key">Ctrl</kbd>+<kbd>V</kbd></dt>
+              <dd>On the canvas: build blocks from a copied query</dd>
+              <dt><kbd>Arrow keys</kbd></dt>
+              <dd>On a block's title bar: move the block (hold <kbd>Shift</kbd> for bigger steps)</dd>
+              <dt><kbd class="mod-key">Ctrl</kbd>+<kbd>D</kbd></dt>
+              <dd>On a block's title bar: duplicate the block</dd>
+              <dt><kbd>Delete</kbd></dt>
+              <dd>On a block's title bar: remove the block</dd>
+            </dl>
+
+            <h2>Concepts</h2>
+            <dl class="help-terms">
+              <dt>Block</dt>
+              <dd>One query block: which entity to start from, its fields, filters and settings.</dd>
+              <dt>Variables tab</dt>
+              <dd>Values passed with the query as <code>$name</code>. Use them as filter values with the <code>$</code> button on a condition.</dd>
+              <dt>Use as variable</dt>
+              <dd>In Settings: the block becomes <code>name as var(…)</code>. It isn't returned; other blocks can <em>Start from</em> its nodes or filter with <code>uid(name)</code>. The blue arrows show these links.</dd>
+              <dt>Incomplete conditions</dt>
+              <dd>A filter condition without a value is marked and left out of the query until you finish it.</dd>
+            </dl>
+            <a class="help-link" href="https://docs.dgraph.io/dql/" target="_blank" rel="noopener">DQL reference on docs.dgraph.io</a>
+          </div>
+        </div>
         <button type="button" id="themeBtn" class="btn btn-square" aria-label="Switch to dark theme" title="Switch to dark theme">
           <svg class="icon icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z" /></svg>
           <svg class="icon icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
@@ -46,7 +81,7 @@
           </div>
         </div>
         <p id="dqlEditHint" class="editor-hint" hidden>
-          Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> or click Apply to update the canvas.
+          Press <kbd class="mod-key">Ctrl</kbd>+<kbd>Enter</kbd> or click Apply to update the canvas.
         </p>
         <div id="dqlEditor" class="editor-host"></div>
         <div class="pane-head pane-head-split">
@@ -74,6 +109,12 @@
             <span id="blockCount" class="pane-meta"></span>
           </h2>
           <div class="pane-actions">
+            <button type="button" id="undoBtn" class="btn btn-quiet btn-square" aria-label="Undo" title="Undo (Ctrl+Z)" disabled>
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3L3 6l3 3" /><path d="M3 6h6.5a3.5 3.5 0 0 1 0 7H7" /></svg>
+            </button>
+            <button type="button" id="redoBtn" class="btn btn-quiet btn-square" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" disabled>
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3l3 3-3 3" /><path d="M13 6H6.5a3.5 3.5 0 0 0 0 7H9" /></svg>
+            </button>
             <div class="entity-menu" id="entityMenuWrap">
               <button type="button" id="addEntityBtn" class="btn btn-primary" aria-haspopup="true" aria-expanded="false">
                 <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
@@ -102,6 +143,13 @@
           </div>
         </div>
 
+        <div class="toast-anchor">
+          <div id="toast" class="toast" hidden>
+            <span id="toastMsg" class="toast-msg"></span>
+            <button type="button" id="toastUndoBtn" class="toast-action">Undo<kbd class="mod-key-combo"></kbd></button>
+          </div>
+        </div>
+
         <section class="console" id="builderConsole" aria-label="Console">
           <div class="console-bar">
             <button type="button" id="consoleToggle" class="console-toggle" aria-expanded="false" aria-controls="consoleBody">
@@ -110,7 +158,7 @@
               <span class="console-count is-error" id="consoleErrorCount" title="Errors" hidden>0</span>
               <span class="console-count is-warn" id="consoleWarnCount" title="Warnings" hidden>0</span>
             </button>
-            <span id="consoleLast" class="console-last"></span>
+            <span id="consoleLast" class="console-last" aria-live="polite"></span>
             <div class="console-tools" id="consoleTools" hidden>
               <select id="consoleLevel" class="select-sm" aria-label="Show messages">
                 <option value="all">All messages</option>
@@ -126,6 +174,8 @@
       </section>
     </main>
   </div>
+
+  <div id="announcer" class="sr-only" aria-live="polite"></div>
 
   <div id="schemaModal" class="modal-overlay" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="schemaModalTitle">

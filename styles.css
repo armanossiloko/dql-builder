@@ -10,16 +10,26 @@
   --field: #ffffff;
   --border: #e2e4e9;
   --border-strong: #cfd3da;
+  /* Input outlines need 3:1 against the field (WCAG 1.4.11). */
+  --field-border: #8f949e;
 
   --text: #1c1e23;
   --text-muted: #5d626d;
-  --text-faint: #8b909a;
+  /* Faint is still body-size text: keep it at 4.5:1 on every surface. */
+  --text-faint: #686d77;
 
   --accent: #15803d;
   --accent-hover: #166534;
   --accent-text: #ffffff;
+  /* Accent as text on accent-soft (counts, active chips). */
+  --accent-ink: #166534;
   --accent-soft: rgba(21, 128, 61, 0.1);
   --accent-line: rgba(21, 128, 61, 0.4);
+  --selection: rgba(21, 128, 61, 0.18);
+
+  --toast-bg: #1c1e23;
+  --toast-text: #f4f5f7;
+  --toast-action: #3dd68c;
 
   --warn: #a15c00;
   --warn-soft: rgba(217, 140, 0, 0.12);
@@ -55,16 +65,23 @@
   --field: #111215;
   --border: #2c2e34;
   --border-strong: #3b3e46;
+  --field-border: #62666f;
 
   --text: #e4e5e9;
   --text-muted: #9a9ca5;
-  --text-faint: #686b74;
+  --text-faint: #90939c;
 
   --accent: #3dd68c;
   --accent-hover: #5fe0a2;
   --accent-text: #08130d;
+  --accent-ink: #3dd68c;
   --accent-soft: rgba(61, 214, 140, 0.12);
   --accent-line: rgba(61, 214, 140, 0.45);
+  --selection: rgba(61, 214, 140, 0.24);
+
+  --toast-bg: #e4e5e9;
+  --toast-text: #141518;
+  --toast-action: #116b33;
 
   --warn: #f2c94c;
   --warn-soft: rgba(242, 201, 76, 0.12);
@@ -99,6 +116,19 @@ html,
 body {
   margin: 0;
   height: 100%;
+}
+
+html {
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::selection {
+  background: var(--selection);
+}
+
+input,
+textarea {
+  caret-color: var(--accent);
 }
 
 body {
@@ -205,9 +235,15 @@ kbd {
 }
 
 .btn-sm {
+  gap: 4px;
   height: var(--control-h-sm);
   padding: 0 8px;
   font-size: 12px;
+}
+
+.btn-sm .icon {
+  width: 12px;
+  height: 12px;
 }
 
 .btn-square {
@@ -252,7 +288,7 @@ kbd {
   height: var(--control-h);
   min-width: 0;
   padding: 0 8px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--field-border);
   border-radius: var(--radius);
   background: var(--field);
   color: var(--text);
@@ -280,7 +316,7 @@ textarea::placeholder {
 
 .input:hover,
 :where(.app input[type="text"], .app input[type="search"], .app select):hover {
-  border-color: var(--border-strong);
+  border-color: var(--text-faint);
 }
 
 .input:focus,
@@ -311,6 +347,19 @@ input[type="checkbox"] {
 .badge-warn {
   background: var(--warn-soft);
   color: var(--warn);
+}
+
+/* Visible to screen readers only */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ==========================================================================
@@ -588,8 +637,8 @@ body.is-splitting {
   position: absolute;
   top: 0;
   left: 0;
-  width: 3200px;
-  height: 2400px;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
 }
 
@@ -600,25 +649,63 @@ body.is-splitting {
   overflow: visible;
 }
 
-.links path {
-  fill: none;
-  stroke: var(--info);
-  stroke-width: 1.5;
+/* Markers take their colour from the <svg>, not from the path using them. */
+.links,
+.link {
+  color: var(--info);
 }
 
-.links marker path {
-  fill: var(--info);
+.link {
+  transition: opacity 0.15s ease-out;
+}
+
+.link-path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.links marker path,
+.link-port {
+  fill: currentColor;
   stroke: none;
 }
 
-.links text {
-  fill: var(--info);
+.link-port {
+  stroke: var(--bg);
+  stroke-width: 2;
+}
+
+.link-label rect {
+  fill: var(--bg);
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+.link-label text {
+  fill: currentColor;
   font: 11px var(--mono);
   text-anchor: middle;
-  paint-order: stroke;
-  stroke: var(--bg);
-  stroke-width: 4px;
-  stroke-linejoin: round;
+  dominant-baseline: central;
+}
+
+/* Hovering or focusing a block brings its links forward. */
+.links.has-active .link:not(.is-active) {
+  opacity: 0.25;
+}
+
+.links .link.is-active .link-path {
+  stroke-width: 2.5;
+}
+
+.links .link.is-active .link-label rect {
+  fill: var(--info-soft);
+}
+
+.entity-node.is-linked {
+  border-color: var(--info);
+  box-shadow: 0 0 0 1px var(--info), var(--shadow-node);
 }
 
 .canvas.drag-over {
@@ -661,12 +748,13 @@ body.is-splitting {
 /* ==========================================================================
    Query blocks (canvas nodes)
    ========================================================================== */
+/* Blocks grow with their content up to the stored height, then scroll. */
 .entity-node {
   position: absolute;
   display: flex;
   flex-direction: column;
-  min-width: 320px;
-  min-height: 240px;
+  min-width: 300px;
+  min-height: 160px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--surface);
@@ -712,6 +800,18 @@ body.is-resizing-node {
   flex-shrink: 0;
 }
 
+.entity-node-header:focus-visible {
+  box-shadow: inset var(--focus);
+}
+
+.entity-node-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
 .entity-node.dragging .entity-node-header {
   cursor: grabbing;
 }
@@ -729,10 +829,6 @@ body.is-resizing-node {
   white-space: nowrap;
   color: var(--text-faint);
   font: 12px var(--mono);
-}
-
-.entity-node-remove {
-  margin-left: auto;
 }
 
 .node-tag {
@@ -804,19 +900,26 @@ body.is-resizing-node {
 
 .node-tab[aria-selected="true"] .tab-count {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* A count with incomplete conditions in it */
+.tab-count.is-warn,
+.node-tab[aria-selected="true"] .tab-count.is-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
 }
 
 .node-panel > .node-section {
   border-bottom: none;
 }
 
+/* Scroll chains to the canvas at the ends, so the wheel can pan past a block. */
 .entity-node-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  overscroll-behavior: contain;
 }
 
 .entity-resize {
@@ -962,7 +1065,7 @@ body.is-resizing-node {
 .chip.active {
   border-color: var(--accent-line);
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-ink);
 }
 
 /* Segmented AND / OR */
@@ -1057,7 +1160,7 @@ body.is-resizing-node {
   width: var(--control-h);
   height: var(--control-h);
   flex-shrink: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--field-border);
   border-right: none;
   border-radius: var(--radius) 0 0 var(--radius);
   background: var(--surface-2);
@@ -1072,7 +1175,19 @@ body.is-resizing-node {
 
 .filter-value-mode[aria-pressed="true"] {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* Conditions that are left out of the query until they are complete */
+.filter-row.is-incomplete :is(input[type="text"], select):not(.filter-predicate, .filter-func) {
+  border-color: var(--warn);
+}
+
+.filter-issue {
+  grid-column: 1 / -1;
+  margin-top: -2px;
+  color: var(--warn);
+  font-size: 12px;
 }
 
 .filter-value-blank {
@@ -1172,10 +1287,6 @@ body.is-resizing-node {
   font-size: 11px;
 }
 
-.alias-input::placeholder {
-  color: transparent;
-}
-
 .field-row:hover .alias-input {
   border-color: var(--border);
   background: var(--field);
@@ -1186,27 +1297,24 @@ body.is-resizing-node {
   background: var(--field);
 }
 
-.field-row:hover .alias-input::placeholder,
-.alias-input:focus::placeholder {
-  color: var(--text-faint);
-}
-
 .field-filter-btn {
-  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--control-h-sm);
   padding: 0 6px;
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
+  border: none;
+  border-radius: var(--radius);
   background: transparent;
   color: var(--text-muted);
-  font: 11px var(--sans);
+  font: 12px var(--sans);
   cursor: pointer;
   flex-shrink: 0;
-  opacity: 0;
 }
 
-.field-row:hover .field-filter-btn,
-.field-filter-btn:focus-visible {
-  opacity: 1;
+.field-filter-btn .icon {
+  width: 12px;
+  height: 12px;
 }
 
 .field-filter-btn:hover {
@@ -1262,7 +1370,7 @@ body.is-resizing-node {
 .console-toggle .chevron {
   width: 12px;
   height: 12px;
-  transition: transform 0.12s ease;
+  transition: transform 0.12s ease-out;
 }
 
 .console-toggle[aria-expanded="true"] .chevron {
@@ -1364,6 +1472,160 @@ body.is-resizing-node {
 
 .console-row.is-hidden {
   display: none;
+}
+
+/* ==========================================================================
+   Toast — confirms a change and offers Undo
+   ========================================================================== */
+/* Zero-height anchor on the canvas' bottom edge, so the toast sits above the console. */
+.toast-anchor {
+  position: relative;
+  height: 0;
+  z-index: 50;
+}
+
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(520px, calc(100% - 32px));
+  padding: 6px 6px 6px 14px;
+  border-radius: var(--radius-lg);
+  background: var(--toast-bg);
+  color: var(--toast-text);
+  box-shadow: var(--shadow-pop);
+  transform: translateX(-50%);
+  animation: toast-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.toast-msg {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toast-action {
+  height: var(--control-h);
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--toast-action);
+  font: 600 13px/1 var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.toast-action:hover {
+  background: color-mix(in srgb, var(--toast-text) 12%, transparent);
+}
+
+.toast-action kbd {
+  margin-left: 6px;
+  border-color: color-mix(in srgb, var(--toast-text) 30%, transparent);
+  background: transparent;
+  color: var(--toast-text);
+  font-weight: 400;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation-name: toast-fade;
+  }
+
+  @keyframes toast-fade {
+    from {
+      opacity: 0;
+    }
+  }
+}
+
+/* ==========================================================================
+   Help popover
+   ========================================================================== */
+.help-wrap {
+  position: relative;
+}
+
+.help-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  width: 380px;
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
+  padding: 14px 16px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-pop);
+}
+
+.help-panel h2 {
+  margin: 14px 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.help-panel h2:first-child {
+  margin-top: 0;
+}
+
+.help-keys {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.help-keys dt {
+  white-space: nowrap;
+}
+
+.help-keys dd {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.help-terms {
+  margin: 0;
+  font-size: 12px;
+}
+
+.help-terms dt {
+  font-weight: 600;
+}
+
+.help-terms dd {
+  margin: 2px 0 10px;
+  color: var(--text-muted);
+}
+
+.help-link {
+  color: var(--accent-ink);
+  text-underline-offset: 2px;
+}
+
+/* Inline help under a setting */
+.kv-help {
+  grid-column: 2;
+  margin-top: -2px;
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 /* ==========================================================================

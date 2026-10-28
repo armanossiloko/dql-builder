@@ -58,9 +58,32 @@
   const consoleClearBtn = document.getElementById("consoleClearBtn");
   const consoleErrorCountEl = document.getElementById("consoleErrorCount");
   const consoleWarnCountEl = document.getElementById("consoleWarnCount");
+  const undoBtn = document.getElementById("undoBtn");
+  const redoBtn = document.getElementById("redoBtn");
+  const toastEl = document.getElementById("toast");
+  const toastMsgEl = document.getElementById("toastMsg");
+  const toastUndoBtn = document.getElementById("toastUndoBtn");
+  const announcerEl = document.getElementById("announcer");
 
   const ICON_CLOSE =
     '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>';
+  const ICON_PLUS =
+    '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>';
+  const ICON_DUPLICATE =
+    '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" /><path d="M10.5 3.5V3A1.5 1.5 0 0 0 9 1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5" /></svg>';
+  const ICON_FILTER =
+    '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11L9.5 8.5v4l-3 1.5V8.5z" /></svg>';
+
+  /** Shortcut modifier as the platform names it. */
+  const MOD_KEY = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? "⌘" : "Ctrl";
+
+  function announce(message) {
+    announcerEl.textContent = "";
+    // A fresh text node makes screen readers repeat identical messages.
+    requestAnimationFrame(() => {
+      announcerEl.textContent = message;
+    });
+  }
 
   /**
    * Each canvas node is one DQL query block.
@@ -133,6 +156,171 @@
       /* ignore */
     }
   }
+
+  /* ---------- Undo / redo ---------- */
+
+  /**
+   * History holds whole-canvas snapshots. Changes are committed a moment
+   * after they settle, so a burst of typing is one step. The schema is kept
+   * by reference: switching schema is undoable without copying it each time.
+   * @typedef {{ nodes: string, schema: object, schemaIsSample: boolean, selectedNodeId: string|null }} Snapshot
+   */
+  const HISTORY_LIMIT = 100;
+  /** @type {Snapshot[]} */
+  const undoStack = [];
+  /** @type {Snapshot[]} */
+  const redoStack = [];
+  /** @type {Snapshot|null} */
+  let committed = null;
+  let historyTimer = null;
+  /** Counts committed steps (the stack length stops growing at the limit). */
+  let historySeq = 0;
+
+  function takeSnapshot() {
+    return {
+      nodes: JSON.stringify(nodes),
+      schema,
+      schemaIsSample,
+      selectedNodeId,
+    };
+  }
+
+  function sameSnapshot(a, b) {
+    return !!a && !!b && a.nodes === b.nodes && a.schema === b.schema;
+  }
+
+  function updateHistoryButtons() {
+    undoBtn.disabled = !undoStack.length;
+    redoBtn.disabled = !redoStack.length;
+  }
+
+  /** Record the current canvas as a step if it changed since the last one. */
+  function commitHistory() {
+    clearTimeout(historyTimer);
+    const now = takeSnapshot();
+    if (!committed) {
+      committed = now;
+      return;
+    }
+    if (sameSnapshot(now, committed)) {
+      committed.selectedNodeId = now.selectedNodeId;
+      return;
+    }
+    undoStack.push(committed);
+    if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+    redoStack.length = 0;
+    committed = now;
+    historySeq += 1;
+    updateHistoryButtons();
+    if (toastStep !== null && toastStep !== historySeq) hideToast();
+  }
+
+  function scheduleHistoryCommit() {
+    clearTimeout(historyTimer);
+    historyTimer = setTimeout(commitHistory, 500);
+  }
+
+  function restoreSnapshot(snap) {
+    const schemaChanged = snap.schema !== schema;
+    schema = snap.schema;
+    schemaIsSample = snap.schemaIsSample;
+    nodes = JSON.parse(snap.nodes);
+    selectedNodeId = nodes.some((n) => n.id === snap.selectedNodeId) ? snap.selectedNodeId : null;
+    committed = snap;
+    if (schemaChanged) renderDock();
+    renderNodes();
+    refreshQuery();
+    updateHistoryButtons();
+  }
+
+  function undo() {
+    commitHistory();
+    hideToast();
+    const prev = undoStack.pop();
+    if (!prev) return;
+    redoStack.push(committed);
+    restoreSnapshot(prev);
+    announce("Undone");
+  }
+
+  function redo() {
+    commitHistory();
+    hideToast();
+    const next = redoStack.pop();
+    if (!next) return;
+    undoStack.push(committed);
+    restoreSnapshot(next);
+    announce("Redone");
+  }
+
+  /* ---------- Toast ---------- */
+
+  let toastTimer = null;
+  /** History step the toast's change was committed as; a later change hides the toast. */
+  let toastStep = null;
+
+  function hideToast() {
+    clearTimeout(toastTimer);
+    toastEl.hidden = true;
+    toastStep = null;
+  }
+
+  function armToastTimer() {
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(hideToast, 7000);
+  }
+
+  /** Call before a destructive change, so pending typing stays its own step. */
+  function checkpoint() {
+    commitHistory();
+  }
+
+  /** "1 block that used it starts" / "2 blocks that used it start" */
+  function usersPhrase(count) {
+    return count === 1
+      ? "1 block that used it starts from all nodes again"
+      : `${count} blocks that used it start from all nodes again`;
+  }
+
+  /** Commit the change that just happened and offer to undo it. */
+  function showUndoToast(message) {
+    commitHistory();
+    toastMsgEl.textContent = message;
+    toastEl.hidden = false;
+    toastStep = historySeq;
+    armToastTimer();
+    announce(`${message}. Press ${MOD_KEY}+Z to undo.`);
+  }
+
+  toastUndoBtn.querySelector("kbd").textContent = `${MOD_KEY}+Z`;
+  toastUndoBtn.addEventListener("click", undo);
+  // Hold the toast while the pointer or focus is on it.
+  toastEl.addEventListener("pointerenter", () => clearTimeout(toastTimer));
+  toastEl.addEventListener("pointerleave", armToastTimer);
+  toastEl.addEventListener("focusin", () => clearTimeout(toastTimer));
+  toastEl.addEventListener("focusout", armToastTimer);
+  undoBtn.addEventListener("click", undo);
+  redoBtn.addEventListener("click", redo);
+  undoBtn.title = `Undo (${MOD_KEY}+Z)`;
+  redoBtn.title = `Redo (${MOD_KEY}+Shift+Z)`;
+
+  function isTextEntry(el) {
+    if (!el) return false;
+    if (el.closest?.(".monaco-editor")) return true;
+    if (el.isContentEditable || el.tagName === "TEXTAREA") return true;
+    return el.tagName === "INPUT" && !["checkbox", "radio", "button"].includes(el.type);
+  }
+
+  // Text fields keep their own undo; everywhere else Ctrl+Z undoes canvas changes.
+  document.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const key = e.key.toLowerCase();
+    if (key !== "z" && key !== "y") return;
+    if (isTextEntry(e.target)) return;
+    e.preventDefault();
+    if (key === "y" || e.shiftKey) redo();
+    else undo();
+  });
 
   function restoreWorkspace() {
     try {
@@ -216,6 +404,7 @@
   }
 
   function writeDqlEditor(value) {
+    markDqlError(null);
     writingDql = true;
     try {
       if (dqlEditor) dqlEditor.setValue(value);
@@ -354,21 +543,28 @@
     return ta;
   }
 
+  /** Plain textareas when Monaco can't load (offline, CDN blocked). */
+  function useFallbackEditors(reason) {
+    if (dqlFallback || dqlEditor) return;
+    consoleWarn(`${reason} Using a plain text editor without highlighting.`, "editor");
+    dqlFallback = makeFallbackTextarea("dqlEditor", { readOnly: false });
+    varsFallback = makeFallbackTextarea("varsEditor", { readOnly: true });
+    dqlFallback.addEventListener("input", () => markDqlDirty());
+    dqlFallback.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        applyDqlFromEditor({ reason: "shortcut" });
+      }
+    });
+    dqlFallback.addEventListener("blur", () => {
+      applyDqlFromEditor({ reason: "blur", soft: true });
+    });
+    setOutputs(queryText, varsText);
+  }
+
   function initEditors() {
     if (!window.require) {
-      dqlFallback = makeFallbackTextarea("dqlEditor", { readOnly: false });
-      varsFallback = makeFallbackTextarea("varsEditor", { readOnly: true });
-      dqlFallback.addEventListener("input", () => markDqlDirty());
-      dqlFallback.addEventListener("keydown", (e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-          e.preventDefault();
-          applyDqlFromEditor({ reason: "shortcut" });
-        }
-      });
-      dqlFallback.addEventListener("blur", () => {
-        applyDqlFromEditor({ reason: "blur", soft: true });
-      });
-      setOutputs(queryText, varsText);
+      useFallbackEditors("The code editor could not load (offline or blocked CDN).");
       return;
     }
 
@@ -388,7 +584,7 @@
           { token: "keyword", foreground: "3dd68c" },
           { token: "string", foreground: "f2c94c" },
           { token: "number", foreground: "8ab4f8" },
-          { token: "comment", foreground: "686b74", fontStyle: "italic" },
+          { token: "comment", foreground: "90939c", fontStyle: "italic" },
         ],
         colors: {
           "editor.background": "#1a1b1f",
@@ -419,7 +615,7 @@
           { token: "keyword", foreground: "15803d" },
           { token: "string", foreground: "a15c00" },
           { token: "number", foreground: "1d5fc2" },
-          { token: "comment", foreground: "8b909a", fontStyle: "italic" },
+          { token: "comment", foreground: "686d77", fontStyle: "italic" },
         ],
         colors: {
           "editor.background": "#ffffff",
@@ -494,7 +690,30 @@
           applyDqlFromEditor({ reason: "blur", soft: true });
         }, 0);
       });
-    });
+    }, () => useFallbackEditors("The code editor could not load (offline or blocked CDN)."));
+  }
+
+  /** Point at a parse error in the editor; no error clears the marker. */
+  function markDqlError(err) {
+    if (!dqlEditor || typeof monaco === "undefined") return;
+    const model = dqlEditor.getModel();
+    if (!err?.line) {
+      monaco.editor.setModelMarkers(model, "dql", []);
+      return;
+    }
+    const line = Math.min(err.line, model.getLineCount());
+    const column = Math.max(1, err.column || 1);
+    const word = model.getWordAtPosition({ lineNumber: line, column });
+    monaco.editor.setModelMarkers(model, "dql", [
+      {
+        severity: monaco.MarkerSeverity.Error,
+        message: String(err.message || err),
+        startLineNumber: line,
+        startColumn: word ? word.startColumn : column,
+        endLineNumber: line,
+        endColumn: word ? word.endColumn : column + 1,
+      },
+    ]);
   }
 
   /* ---------- Helpers ---------- */
@@ -518,13 +737,14 @@
     return { op: op === "OR" ? "OR" : "AND", conditions: [] };
   }
 
-  function newFilterCondition(predicate = "", typeHint = "string") {
+  /** New conditions start without a value; they stay out of the query until filled in. */
+  function newFilterCondition(predicate = "") {
     return {
       id: filterUid(),
       func: "eq",
       predicate,
       valueMode: "literal",
-      literal: defaultParamValue(typeHint),
+      literal: "",
       paramName: "",
     };
   }
@@ -975,22 +1195,51 @@
         const y1 = a.offsetTop + 18;
         const y2 = b.offsetTop + 18;
         const bend = Math.max(40, Math.abs(x2 - x1) / 2) * (forward ? 1 : -1);
+        // The label is a small tag on the curve's midpoint; 6.6px per mono char at 11px.
+        const mx = (x1 + x2) / 2;
+        const my = (y1 + y2) / 2;
+        const labelW = Math.round(name.length * 6.6 + 14);
         paths.push(`
-          <path d="M${x1} ${y1} C${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}" marker-end="url(#link-arrow)" />
-          <text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 8}">${escapeAttr(name)}</text>
+          <g class="link" data-from="${from.id}" data-to="${to.id}">
+            <path class="link-path" d="M${x1} ${y1} C${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}" marker-end="url(#link-arrow)" />
+            <circle class="link-port" cx="${x1}" cy="${y1}" r="4" />
+            <g class="link-label">
+              <rect x="${mx - labelW / 2}" y="${my - 10}" width="${labelW}" height="20" rx="10" />
+              <text x="${mx}" y="${my}">${escapeAttr(name)}</text>
+            </g>
+          </g>
         `);
       });
     });
     canvasSurfaceEl.innerHTML = paths.length
       ? `<svg class="links" width="100%" height="100%">
           <defs>
-            <marker id="link-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+            <marker id="link-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
               <path d="M0 0L8 4L0 8z" />
             </marker>
           </defs>
           ${paths.join("")}
         </svg>`
       : "";
+    if (activeLinkNode) highlightLinks(activeLinkNode);
+  }
+
+  /** Block the pointer or focus is on; its links and linked blocks stand out. */
+  let activeLinkNode = null;
+
+  function highlightLinks(id) {
+    activeLinkNode = id;
+    const svg = canvasSurfaceEl.querySelector(".links");
+    const linked = new Set();
+    svg?.querySelectorAll(".link").forEach((link) => {
+      const active = !!id && (link.dataset.from === id || link.dataset.to === id);
+      link.classList.toggle("is-active", active);
+      if (active) linked.add(link.dataset.from === id ? link.dataset.to : link.dataset.from);
+    });
+    svg?.classList.toggle("has-active", linked.size > 0);
+    canvasEl.querySelectorAll(".entity-node").forEach((el) => {
+      el.classList.toggle("is-linked", linked.has(el.dataset.id));
+    });
   }
 
   function setSelected(id) {
@@ -1007,8 +1256,8 @@
   const DEFAULT_NODE_H = 520;
   const NODE_GAP = 56;
   const CANVAS_PAD = 48;
-  const CANVAS_MIN_W = 3200;
-  const CANVAS_MIN_H = 2400;
+  /** Room past the farthest block, so there is always space to drag into. */
+  const CANVAS_MARGIN = 240;
 
   function estimateNodeSize(node) {
     return {
@@ -1081,26 +1330,28 @@
     });
   }
 
+  /** Size the scroll area to the blocks: no scrollbars until something is out of view. */
   function updateCanvasSurface() {
     if (!canvasSurfaceEl) return;
-    let maxR = CANVAS_MIN_W;
-    let maxB = CANVAS_MIN_H;
-    nodes.forEach((n) => {
-      const s = estimateNodeSize(n);
-      maxR = Math.max(maxR, n.x + s.w + 600);
-      maxB = Math.max(maxB, n.y + s.h + 600);
-    });
-    // Also account for live DOM sizes when available.
+    let maxR = 0;
+    let maxB = 0;
     canvasEl.querySelectorAll(".entity-node").forEach((el) => {
       const x = parseFloat(el.style.left) || 0;
       const y = parseFloat(el.style.top) || 0;
-      maxR = Math.max(maxR, x + el.offsetWidth + 600);
-      maxB = Math.max(maxB, y + el.offsetHeight + 600);
+      maxR = Math.max(maxR, x + el.offsetWidth + CANVAS_MARGIN);
+      maxB = Math.max(maxB, y + el.offsetHeight + CANVAS_MARGIN);
     });
-    canvasSurfaceEl.style.width = `${Math.ceil(maxR)}px`;
-    canvasSurfaceEl.style.height = `${Math.ceil(maxB)}px`;
+    // Never larger than needed: an empty canvas fits its pane exactly.
+    const fitsW = maxR <= canvasEl.clientWidth;
+    const fitsH = maxB <= canvasEl.clientHeight;
+    canvasSurfaceEl.style.width = fitsW ? "100%" : `${Math.ceil(maxR)}px`;
+    canvasSurfaceEl.style.height = fitsH ? "100%" : `${Math.ceil(maxB)}px`;
     drawLinks();
   }
+
+  // Blocks change height with their content (tabs, toggles), and the pane resizes.
+  const surfaceObserver = new ResizeObserver(() => updateCanvasSurface());
+  surfaceObserver.observe(canvasEl);
 
   function closeEntityMenu() {
     if (entityMenuEl.hidden) return;
@@ -1235,15 +1486,24 @@
     { id: "settings", label: "Settings" },
   ];
 
+  function tabCountHtml(count, incomplete) {
+    if (!count) return "";
+    const warn = incomplete
+      ? ` is-warn" title="${incomplete} incomplete condition${incomplete === 1 ? "" : "s"}`
+      : "";
+    return `<span class="tab-count${warn}">${count}</span>`;
+  }
+
   function renderNodeTabs(node, activeTab) {
     const counts = {
       fields: countSelected(node.selection),
       filter: ensureFilterGroup(node.rootFilter).conditions.length,
       variables: (node.params || []).length,
     };
+    const incomplete = countIncomplete(node);
+    const warnings = { fields: incomplete.edges, filter: incomplete.root };
     return NODE_TABS.map((tab) => {
       const active = tab.id === activeTab;
-      const count = counts[tab.id];
       return `
         <button
           type="button"
@@ -1254,9 +1514,37 @@
           aria-controls="${node.id}-panel-${tab.id}"
           aria-selected="${active}"
           tabindex="${active ? 0 : -1}"
-        >${tab.label}${count ? `<span class="tab-count">${count}</span>` : ""}</button>
+        >${tab.label}${tabCountHtml(counts[tab.id], warnings[tab.id])}</button>
       `;
     }).join("");
+  }
+
+  /** Refresh tab warnings and a condition row's state without a re-render (typing). */
+  function updateConditionState(nodeEl, node, row, cond, typeName) {
+    const issue = conditionIssue(cond, typeName);
+    row.classList.toggle("is-incomplete", !!issue);
+    let note = row.querySelector(".filter-issue");
+    if (issue && !note) {
+      note = document.createElement("p");
+      note.className = "filter-issue";
+      note.id = `${cond.id}-issue`;
+      row.appendChild(note);
+    }
+    if (note) {
+      if (issue) note.textContent = issue;
+      else note.remove();
+    }
+    row.querySelector(".filter-literal")?.setAttribute("aria-invalid", String(!!issue));
+    const incomplete = countIncomplete(node);
+    const warnings = { fields: incomplete.edges, filter: incomplete.root };
+    nodeEl.querySelectorAll(".node-tab").forEach((tab) => {
+      const badge = tab.querySelector(".tab-count");
+      if (!badge || !(tab.dataset.tab in warnings)) return;
+      const n = warnings[tab.dataset.tab];
+      badge.classList.toggle("is-warn", !!n);
+      if (n) badge.title = `${n} incomplete condition${n === 1 ? "" : "s"}`;
+      else badge.removeAttribute("title");
+    });
   }
 
   function nodePanel(node, tabId, activeTab, html) {
@@ -1291,11 +1579,13 @@
     }
 
     const isParam = cond.valueMode === "param";
+    // `$` is DQL's own variable sigil, so the button shows it; the name says what it does.
     const toggle = `
       <button
         type="button"
         class="filter-value-mode"
         aria-pressed="${isParam}"
+        aria-label="Use a variable"
         title="${isParam ? "Using a variable. Click to type a value instead." : "Use a variable instead of a value"}"
       >$</button>
     `;
@@ -1313,10 +1603,30 @@
       `;
     }
 
+    const issue = conditionIssue(cond, typeName);
+    const describedBy = issue ? ` aria-describedby="${cond.id}-issue"` : "";
+    const type = paramTypeForPredicate(typeName, cond.predicate);
+    if (type === "bool") {
+      return `
+        <div class="filter-value">
+          ${toggle}
+          <select class="filter-literal-bool" aria-label="Value"${describedBy}>${optionsHtml(
+            [
+              { value: "", label: "Pick…" },
+              { value: "true", label: "true" },
+              { value: "false", label: "false" },
+            ],
+            String(cond.literal || "").toLowerCase()
+          )}</select>
+        </div>
+      `;
+    }
+
+    const placeholder = type === "int" || type === "float" ? "number" : "value";
     return `
       <div class="filter-value">
         ${toggle}
-        <input type="text" class="filter-literal" value="${escapeAttr(cond.literal || "")}" placeholder="value" spellcheck="false" aria-label="Value" />
+        <input type="text" class="filter-literal" value="${escapeAttr(cond.literal || "")}" placeholder="${placeholder}" spellcheck="false" aria-label="Value" aria-invalid="${!!issue}"${describedBy}${type === "string" ? "" : ' inputmode="decimal"'} />
       </div>
     `;
   }
@@ -1325,9 +1635,12 @@
     const g = ensureFilterGroup(group);
     const preds = scalarOptionsForType(typeName);
     const rows = g.conditions
-      .map(
-        (cond) => `
-          <div class="filter-row" data-filter-id="${cond.id}">
+      .map((cond) => {
+        const issue = conditionIssue(cond, typeName);
+        // A var filter with no variable to pick already says so in its value slot.
+        const showIssue = issue && !(isVarFilter(cond.func) && !usableVars(node, typeName).length);
+        return `
+          <div class="filter-row${issue ? " is-incomplete" : ""}" data-filter-id="${cond.id}">
             ${
               isVarFilter(cond.func)
                 ? `<span class="filter-self" title="The ${escapeAttr(typeName)} nodes themselves">${escapeAttr(typeName)}</span>`
@@ -1339,17 +1652,18 @@
             <select class="filter-func" aria-label="Function">${optionsHtml(FILTER_FUNCS, cond.func || "eq")}</select>
             ${renderFilterValueControls(cond, node, typeName)}
             <button type="button" class="btn-icon is-danger filter-remove" title="Remove condition" aria-label="Remove condition">${ICON_CLOSE}</button>
+            ${showIssue ? `<p class="filter-issue" id="${cond.id}-issue">${escapeAttr(issue)}</p>` : ""}
           </div>
-        `
-      )
+        `;
+      })
       .join("");
 
     const opToggle =
       g.conditions.length > 1
         ? `
           <div class="segmented" role="group" aria-label="Combine conditions with">
-            <button type="button" class="filter-op-btn${g.op !== "OR" ? " active" : ""}" data-op="AND" title="Match all conditions">AND</button>
-            <button type="button" class="filter-op-btn${g.op === "OR" ? " active" : ""}" data-op="OR" title="Match any condition">OR</button>
+            <button type="button" class="filter-op-btn${g.op !== "OR" ? " active" : ""}" data-op="AND" aria-pressed="${g.op !== "OR"}" title="Match all conditions">AND</button>
+            <button type="button" class="filter-op-btn${g.op === "OR" ? " active" : ""}" data-op="OR" aria-pressed="${g.op === "OR"}" title="Match any condition">OR</button>
           </div>
         `
         : "";
@@ -1359,7 +1673,7 @@
         <div class="section-head">
           ${title ? `<span class="section-title">${escapeAttr(title)}</span>` : ""}
           ${opToggle}
-          <button type="button" class="btn btn-quiet btn-sm push add-filter">+ Add condition</button>
+          <button type="button" class="btn btn-quiet btn-sm push add-filter">${ICON_PLUS}Add condition</button>
         </div>
         ${rows || (emptyText ? `<p class="section-empty">${escapeAttr(emptyText)}</p>` : "")}
       </div>
@@ -1394,7 +1708,7 @@
               title: `Filter ${label}`,
             });
           } else {
-            edgeFilterBtn = `<button type="button" class="field-filter-btn add-edge-filter" data-edge-path="${escapeAttr(key)}" title="Filter the ${escapeAttr(label)} edge">+ Filter</button>`;
+            edgeFilterBtn = `<button type="button" class="field-filter-btn add-edge-filter" data-edge-path="${escapeAttr(key)}" title="Only return the ${escapeAttr(label)} nodes that match a condition" aria-label="Filter ${escapeAttr(label)}">${ICON_FILTER}Filter</button>`;
           }
           nestedHtml = `
             <ul class="nested-fields">
@@ -1525,7 +1839,7 @@
     return `
       <div class="node-section params-section">
         <div class="section-head">
-          <button type="button" class="btn btn-quiet btn-sm push add-param">+ Add variable</button>
+          <button type="button" class="btn btn-quiet btn-sm push add-param">${ICON_PLUS}Add variable</button>
         </div>
         ${head}${rows || '<p class="section-empty">Variables become $name in the query and can be used as filter values.</p>'}
       </div>
@@ -1580,10 +1894,15 @@
           </div>
           ${isVar ? `<span></span><p class="kv-note${users.length ? "" : " is-warn"}">${usage}</p>` : ""}
           <label class="kv-label" for="${node.id}-start">Start from</label>
-          <select id="${node.id}-start" class="root-var-select" title="Which ${escapeAttr(node.type)} nodes this block starts from">${optionsHtml(
+          <select id="${node.id}-start" class="root-var-select" title="Which ${escapeAttr(node.type)} nodes this block starts from"${startOptions.length > 1 ? "" : ` aria-describedby="${node.id}-start-help"`}>${optionsHtml(
             startOptions,
             node.rootVar || ""
           )}</select>
+          ${
+            startOptions.length > 1
+              ? ""
+              : `<p class="kv-help" id="${node.id}-start-help">To start from fewer nodes, turn on “Use as variable” in another ${escapeAttr(node.type)} block.</p>`
+          }
           <label class="kv-label" for="${node.id}-name" ${isVar ? "hidden" : ""}>Name</label>
           <input
             ${isVar ? "hidden" : ""}
@@ -1615,7 +1934,83 @@
     `;
   }
 
+  /* A re-render replaces every block's DOM. Remember which control had focus as
+     a selector inside its block, so keyboard users stay where they were. */
+
+  const FOCUS_ATTRS = ["path", "aliasPath", "tab", "directive", "op", "edgePath"];
+
+  function controlSelector(el) {
+    const cls = [...el.classList].find((c) => !c.startsWith("is-") && c !== "btn" && c !== "btn-icon");
+    let sel = el.tagName.toLowerCase() + (cls ? `.${cls}` : "");
+    FOCUS_ATTRS.forEach((attr) => {
+      const value = el.dataset[attr];
+      if (value == null) return;
+      const name = attr.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+      sel += `[data-${name}="${CSS.escape(value)}"]`;
+    });
+    return sel;
+  }
+
+  function captureFocus() {
+    const el = document.activeElement;
+    const nodeEl = el?.closest?.(".entity-node");
+    if (!nodeEl || !canvasEl.contains(nodeEl)) return null;
+
+    const scopes = [];
+    const row = el.closest("[data-filter-id], [data-param-id]");
+    const panel = el.closest(".filter-panel");
+    if (panel) scopes.push(`.filter-panel[data-edge-path="${CSS.escape(panel.dataset.edgePath || "")}"]`);
+    if (row?.dataset.filterId) scopes.push(`[data-filter-id="${row.dataset.filterId}"]`);
+    if (row?.dataset.paramId) scopes.push(`[data-param-id="${row.dataset.paramId}"]`);
+
+    // When the row itself goes away (a removed condition or variable), land on its "Add" button.
+    let fallback = null;
+    if (row?.dataset.filterId && panel) fallback = `${scopes[0]} .add-filter`;
+    else if (row?.dataset.paramId) fallback = ".add-param";
+
+    const control = el === nodeEl ? "" : controlSelector(el);
+    return {
+      id: nodeEl.dataset.id,
+      selector: [...(row ? scopes : scopes.slice(0, 1)), control].filter(Boolean).join(" ") || null,
+      fallback,
+      selection:
+        typeof el.selectionStart === "number" ? [el.selectionStart, el.selectionEnd] : null,
+    };
+  }
+
+  function restoreFocus(saved) {
+    if (!saved) return;
+    const nodeEl = canvasEl.querySelector(`.entity-node[data-id="${saved.id}"]`);
+    if (!nodeEl) {
+      // The block is gone: keep focus on the canvas instead of dropping it to <body>.
+      (nodes.length ? canvasEl : addEntityBtn).focus({ preventScroll: true });
+      return;
+    }
+    const find = (sel) => {
+      if (!sel) return null;
+      try {
+        return [...nodeEl.querySelectorAll(sel)].find((el) => !el.closest("[hidden]")) || null;
+      } catch {
+        return null;
+      }
+    };
+    const target =
+      find(saved.selector) ||
+      find(saved.fallback) ||
+      nodeEl.querySelector('.node-tab[aria-selected="true"]') ||
+      nodeEl.querySelector(".entity-node-header");
+    target?.focus({ preventScroll: true });
+    if (saved.selection && target === find(saved.selector) && typeof target.setSelectionRange === "function") {
+      try {
+        target.setSelectionRange(...saved.selection);
+      } catch {
+        /* not a text field */
+      }
+    }
+  }
+
   function renderNodes() {
+    const savedFocus = captureFocus();
     // Full re-render replaces the DOM — keep field-list scroll so toggling
     // a property near the bottom doesn't jump back to the top.
     const fieldScroll = new Map();
@@ -1627,7 +2022,10 @@
       }
     });
 
-    canvasEl.querySelectorAll(".entity-node").forEach((el) => el.remove());
+    canvasEl.querySelectorAll(".entity-node").forEach((el) => {
+      surfaceObserver.unobserve(el);
+      el.remove();
+    });
 
     nodes.forEach((node) => {
       const def = schema[node.type];
@@ -1639,7 +2037,9 @@
       el.style.zIndex = selectedNodeId === node.id ? "5" : "2";
       const size = estimateNodeSize(node);
       el.style.width = `${size.w}px`;
-      el.style.height = `${size.h}px`;
+      // Blocks fit their content up to the stored height; a manual resize fixes it.
+      if (node.fixedHeight) el.style.height = `${size.h}px`;
+      else el.style.maxHeight = `${size.h}px`;
       if (!node.width) node.width = size.w;
       if (!node.height) node.height = size.h;
 
@@ -1653,13 +2053,24 @@
       `;
 
       el.innerHTML = `
-        <header class="entity-node-header" data-drag-handle title="Drag to move">
+        <header
+          class="entity-node-header"
+          data-drag-handle
+          tabindex="0"
+          role="group"
+          aria-label="${escapeAttr(node.type)} block ${escapeAttr(node.varName || node.name)}"
+          aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight Delete ${MOD_KEY === "Ctrl" ? "Control" : "Meta"}+D"
+          title="Drag to move. When focused: arrow keys move, Delete removes, ${MOD_KEY}+D duplicates."
+        >
           <span class="dot" style="background:${dotColor(def.color)}"></span>
           <span class="entity-type-label">${escapeAttr(node.type)}</span>
           ${node.varName ? `<span class="node-tag is-var" title="Defines the variable ${escapeAttr(node.varName)}; not returned">as ${escapeAttr(node.varName)}</span>` : ""}
           <span class="entity-node-name" ${node.varName ? "hidden" : ""}>${escapeAttr(node.name)}</span>
           ${node.rootVar ? `<span class="node-tag" title="Starts from the nodes in ${escapeAttr(node.rootVar)}">from ${escapeAttr(node.rootVar)}</span>` : ""}
-          <button type="button" class="btn-icon is-danger entity-node-remove" title="Remove block" aria-label="Remove ${escapeAttr(node.type)} block">${ICON_CLOSE}</button>
+          <span class="entity-node-actions">
+            <button type="button" class="btn-icon entity-node-duplicate" title="Duplicate block (${MOD_KEY}+D)" aria-label="Duplicate ${escapeAttr(node.type)} block">${ICON_DUPLICATE}</button>
+            <button type="button" class="btn-icon is-danger entity-node-remove" title="Remove block (Delete)" aria-label="Remove ${escapeAttr(node.type)} block">${ICON_CLOSE}</button>
+          </span>
         </header>
         <div class="node-tabs" role="tablist" aria-label="${escapeAttr(node.type)} block">
           ${renderNodeTabs(node, activeTab)}
@@ -1720,8 +2131,9 @@
       });
 
       header.addEventListener("pointerdown", (e) => {
-        if (e.target.closest(".entity-node-remove")) return;
+        if (e.target.closest(".entity-node-actions")) return;
         e.preventDefault();
+        header.focus({ preventScroll: true });
         setSelected(node.id);
         const rect = el.getBoundingClientRect();
         moveState = {
@@ -1751,6 +2163,43 @@
           resizeHandle.setPointerCapture?.(e.pointerId);
         });
       }
+
+      header.addEventListener("keydown", (e) => {
+        if (e.target !== header) return;
+        const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+        if (arrows[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          const step = e.shiftKey ? 64 : 16;
+          node.x = Math.max(0, node.x + arrows[e.key][0] * step);
+          node.y = Math.max(0, node.y + arrows[e.key][1] * step);
+          el.style.left = `${node.x}px`;
+          el.style.top = `${node.y}px`;
+          setSelected(node.id);
+          updateCanvasSurface();
+          scrollNodeIntoView(node.id);
+          scheduleSaveWorkspace();
+          scheduleHistoryCommit();
+        } else if (e.key === "Delete" || e.key === "Backspace") {
+          e.preventDefault();
+          removeNode(node.id);
+        } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "d") {
+          e.preventDefault();
+          duplicateNode(node.id);
+        }
+      });
+
+      el.querySelector(".entity-node-duplicate").addEventListener("click", (e) => {
+        e.stopPropagation();
+        duplicateNode(node.id);
+      });
+
+      // Pointing at a block brings its variable links forward.
+      el.addEventListener("pointerenter", () => highlightLinks(node.id));
+      el.addEventListener("pointerleave", () => highlightLinks(null));
+      el.addEventListener("focusin", () => highlightLinks(node.id));
+      el.addEventListener("focusout", (e) => {
+        if (!el.contains(e.relatedTarget)) highlightLinks(null);
+      });
 
       stopDragPropagation(nameInput);
       nameInput.addEventListener("input", () => {
@@ -1824,24 +2273,21 @@
       const varToggle = el.querySelector(".var-toggle");
       stopDragPropagation(varToggle);
       varToggle.addEventListener("change", () => {
+        let message = "";
         if (varToggle.checked) {
           node.varName = uniqueVarName(`${node.type.charAt(0).toLowerCase()}${node.type.slice(1)}Ids`, node.id);
         } else {
           const users = variableUsers(node);
-          if (
-            users.length &&
-            !window.confirm(
-              `${users.length} block${users.length === 1 ? " uses" : "s use"} ${node.varName}. They will start from all their nodes again. Continue?`
-            )
-          ) {
-            varToggle.checked = true;
-            return;
+          if (users.length) {
+            checkpoint();
+            message = `${node.varName} is no longer a variable; ${usersPhrase(users.length)}`;
           }
           dropVarRefs(node.varName);
           node.varName = "";
         }
         renderNodes();
         refreshQuery();
+        if (message) showUndoToast(message);
       });
 
       const varNameInput = el.querySelector(".var-name-input");
@@ -1873,19 +2319,7 @@
 
       el.querySelector(".entity-node-remove").addEventListener("click", (e) => {
         e.stopPropagation();
-        if (variableUsers(node).length) {
-          consoleWarn(
-            `Removed variable ${node.varName}; blocks that used it start from all their nodes again`,
-            "variables"
-          );
-        }
-        if (node.varName) dropVarRefs(node.varName);
-        nodes = nodes.filter((n) => n.id !== node.id);
-        fieldQueries.delete(node.id);
-        nodeTabs.delete(node.id);
-        if (selectedNodeId === node.id) selectedNodeId = null;
-        renderNodes();
-        refreshQuery();
+        removeNode(node.id);
       });
 
       el.querySelectorAll(".directive-toggle").forEach((btn) => {
@@ -2004,9 +2438,7 @@
         const used = new Set(group.conditions.map((c) => c.predicate));
         const next = preds.find((p) => !used.has(p.name)) || preds[0];
         const predName = next?.name || "";
-        group.conditions.push(
-          newFilterCondition(predName, paramTypeForPredicate(typeName, predName))
-        );
+        group.conditions.push(newFilterCondition(predName));
         renderNodes();
         refreshQuery();
       };
@@ -2043,11 +2475,12 @@
           const predEl = row.querySelector(".filter-predicate");
           const modeEl = row.querySelector(".filter-value-mode");
           const literalEl = row.querySelector(".filter-literal");
+          const boolEl = row.querySelector(".filter-literal-bool");
           const paramEl = row.querySelector(".filter-param");
           const varRefEl = row.querySelector(".filter-var-ref");
           const removeBtn = row.querySelector(".filter-remove");
 
-          [funcEl, predEl, modeEl, literalEl, paramEl, varRefEl, removeBtn]
+          [funcEl, predEl, modeEl, literalEl, boolEl, paramEl, varRefEl, removeBtn]
             .filter(Boolean)
             .forEach(stopDragPropagation);
 
@@ -2065,10 +2498,15 @@
             refreshQuery();
           });
           predEl?.addEventListener("change", () => {
+            const prevType = paramTypeForPredicate(typeName, cond.predicate);
             cond.predicate = predEl.value;
             const type = paramTypeForPredicate(typeName, cond.predicate);
-            if (cond.valueMode === "literal" && !isUnaryFilter(cond.func)) {
-              cond.literal = defaultParamValue(type);
+            // A value typed for one predicate type rarely fits another; keep it otherwise.
+            if (type !== prevType) {
+              if (cond.valueMode === "literal") cond.literal = "";
+              renderNodes();
+            } else {
+              updateConditionState(el, node, row, cond, typeName);
             }
             refreshQuery();
           });
@@ -2104,10 +2542,17 @@
           });
           literalEl?.addEventListener("input", () => {
             cond.literal = literalEl.value;
+            updateConditionState(el, node, row, cond, typeName);
+            refreshQuery();
+          });
+          boolEl?.addEventListener("change", () => {
+            cond.literal = boolEl.value;
+            updateConditionState(el, node, row, cond, typeName);
             refreshQuery();
           });
           paramEl?.addEventListener("change", () => {
             cond.paramName = paramEl.value;
+            updateConditionState(el, node, row, cond, typeName);
             refreshQuery();
           });
           varRefEl?.addEventListener("change", () => {
@@ -2133,6 +2578,8 @@
           const current = getNode(node.id);
           if (!current) return;
 
+          checkpoint();
+          let lost = "";
           if (input.checked) {
             if (kind === "object") {
               current.selection = setAtPath(current.selection, path, {});
@@ -2140,8 +2587,16 @@
               current.selection = setAtPath(current.selection, path, null);
             }
           } else {
-            current.selection = setAtPath(current.selection, path, undefined);
             const pathStr = pathKey(path);
+            const nested = countSelected(getAtPath(current.selection, path));
+            const nestedFilters = Object.entries(current.edgeFilters || {})
+              .filter(([key]) => key === pathStr || key.startsWith(`${pathStr}.`))
+              .reduce((sum, [, g]) => sum + (g?.conditions?.length || 0), 0);
+            const parts = [];
+            if (nested) parts.push(`${nested} nested field${nested === 1 ? "" : "s"}`);
+            if (nestedFilters) parts.push(`${nestedFilters} filter${nestedFilters === 1 ? "" : "s"}`);
+            if (parts.length) lost = `Removed ${fieldDisplayName(path[path.length - 1])} with ${parts.join(" and ")}`;
+            current.selection = setAtPath(current.selection, path, undefined);
             Object.keys(current.aliases || {}).forEach((key) => {
               if (key === pathStr || key.startsWith(`${pathStr}.`)) {
                 delete current.aliases[key];
@@ -2156,6 +2611,7 @@
           }
           renderNodes();
           refreshQuery();
+          if (lost) showUndoToast(lost);
         });
       });
 
@@ -2165,6 +2621,7 @@
       });
 
       canvasEl.appendChild(el);
+      surfaceObserver.observe(el);
       if (fieldQuery) applyFieldSearch(el, fieldQuery);
 
       const savedScroll = fieldScroll.get(node.id);
@@ -2179,6 +2636,55 @@
 
     updateEmptyState();
     updateCanvasSurface();
+    restoreFocus(savedFocus);
+  }
+
+  function removeNode(id) {
+    const node = getNode(id);
+    if (!node) return;
+    checkpoint();
+    const users = variableUsers(node);
+    if (node.varName) dropVarRefs(node.varName);
+    nodes = nodes.filter((n) => n.id !== id);
+    fieldQueries.delete(id);
+    nodeTabs.delete(id);
+    if (selectedNodeId === id) selectedNodeId = null;
+    renderNodes();
+    refreshQuery();
+    const label = `${node.type} block${node.varName ? ` (${node.varName})` : ""}`;
+    showUndoToast(users.length ? `Removed ${label}; ${usersPhrase(users.length)}` : `Removed ${label}`);
+  }
+
+  /** Copy a block next to the original with fresh ids and names. */
+  function duplicateNode(id) {
+    const source = getNode(id);
+    if (!source) return;
+    const copy = JSON.parse(JSON.stringify(source));
+    copy.id = uid();
+    copy.name = defaultName(source.type);
+    copy.resultName = "";
+    if (source.varName) copy.varName = uniqueVarName(source.varName, copy.id);
+    copy.params = (copy.params || []).map((p) => ({ ...p, id: paramUid() }));
+    const freshIds = (g) => {
+      (g?.conditions || []).forEach((c) => {
+        c.id = filterUid();
+      });
+    };
+    freshIds(copy.rootFilter);
+    Object.values(copy.edgeFilters || {}).forEach(freshIds);
+
+    const size = estimateNodeSize(source);
+    const pos = findFreePosition(size.w, size.h, { x: source.x + size.w + NODE_GAP, y: source.y });
+    copy.x = pos.x;
+    copy.y = pos.y;
+    nodes.push(copy);
+    nodeTabs.set(copy.id, nodeTabs.get(id) || "fields");
+    selectedNodeId = copy.id;
+    renderNodes();
+    refreshQuery();
+    scrollNodeIntoView(copy.id);
+    canvasEl.querySelector(`.entity-node[data-id="${copy.id}"] .entity-node-header`)?.focus({ preventScroll: true });
+    announce(`Duplicated ${source.type} block`);
   }
 
   function placeEntity(typeName, x, y) {
@@ -2317,17 +2823,53 @@
     return String(param.value ?? "");
   }
 
-  function formatFilterCondition(cond, typeName) {
-    if (isVarFilter(cond?.func)) {
-      return cond.varRef && varDefiner(cond.varRef) ? `${cond.func}(${cond.varRef})` : null;
+  /** Why a condition can't go into the query yet, or "" when it is complete. */
+  function conditionIssue(cond, typeName) {
+    if (!cond?.func) return "Pick a function";
+    if (isVarFilter(cond.func)) {
+      return cond.varRef && varDefiner(cond.varRef) ? "" : "Pick a variable block";
     }
-    if (!cond?.func || !cond?.predicate) return null;
+    if (!cond.predicate) return "Pick a predicate";
+    if (isUnaryFilter(cond.func)) return "";
+    if (cond.valueMode === "param") {
+      const name = sanitizeName(cond.paramName, "");
+      const exists = nodes.some((n) => (n.params || []).some((p) => sanitizeName(p.name, "") === name));
+      return name && exists ? "" : "Pick a variable";
+    }
+    const value = String(cond.literal ?? "").trim();
+    if (!value) return "Needs a value";
+    const type = paramTypeForPredicate(typeName, cond.predicate);
+    if (type === "int" && !/^[+-]?\d+$/.test(value)) return "Needs a whole number";
+    if (type === "float" && !Number.isFinite(Number(value))) return "Needs a number";
+    if (type === "bool" && !/^(true|false)$/i.test(value)) return "Needs true or false";
+    return "";
+  }
+
+  /** Call fn(cond, typeName, edgePath) for every filter condition of a block. */
+  function forEachCondition(node, fn) {
+    (node.rootFilter?.conditions || []).forEach((c) => fn(c, node.type, ""));
+    Object.entries(node.edgeFilters || {}).forEach(([edgePath, g]) => {
+      const typeName = typeAtEdgePath(node.type, edgePath);
+      (g?.conditions || []).forEach((c) => fn(c, typeName, edgePath));
+    });
+  }
+
+  /** Incomplete conditions on the block itself (Filter tab) and on its edges (Fields tab). */
+  function countIncomplete(node) {
+    const counts = { root: 0, edges: 0 };
+    forEachCondition(node, (c, typeName, edgePath) => {
+      if (conditionIssue(c, typeName)) counts[edgePath ? "edges" : "root"] += 1;
+    });
+    return counts;
+  }
+
+  function formatFilterCondition(cond, typeName) {
+    if (conditionIssue(cond, typeName)) return null;
+    if (isVarFilter(cond.func)) return `${cond.func}(${cond.varRef})`;
     if (isUnaryFilter(cond.func)) return `${cond.func}(${cond.predicate})`;
 
     if (cond.valueMode === "param") {
-      const name = sanitizeName(cond.paramName, "");
-      if (!name) return null;
-      return `${cond.func}(${cond.predicate}, $${name})`;
+      return `${cond.func}(${cond.predicate}, $${sanitizeName(cond.paramName, "")})`;
     }
 
     const type = paramTypeForPredicate(typeName, cond.predicate);
@@ -2425,9 +2967,15 @@
   function refreshQuery() {
     try {
       const { operations: groups, unused } = planOperations();
-      const note = unused.length
-        ? `# Not used by any block yet, so left out: ${unused.join(", ")}\n`
-        : "";
+      const incomplete = nodes.reduce((sum, n) => {
+        const c = countIncomplete(n);
+        return sum + c.root + c.edges;
+      }, 0);
+      const note =
+        (unused.length ? `# Not used by any block yet, so left out: ${unused.join(", ")}\n` : "") +
+        (incomplete
+          ? `# ${incomplete} incomplete filter condition${incomplete === 1 ? " is" : "s are"} left out until finished\n`
+          : "");
       if (!groups.length) {
         setOutputs(nodes.length ? note || "# Pick at least one predicate on a query block." : "", "");
         return;
@@ -2521,6 +3069,9 @@
       setOutputs(`# Query build failed:\n# ${err.message || err}`, "");
     } finally {
       scheduleSaveWorkspace();
+      // Typing settles into one step; clicks and picks are a step each.
+      if (isTextEntry(document.activeElement)) scheduleHistoryCommit();
+      else commitHistory();
     }
   }
 
@@ -2528,15 +3079,24 @@
 
   async function copyText(text, button) {
     if (!text) return;
+    const flash = (label, ms) => {
+      clearTimeout(button._flashTimer);
+      if (!button.dataset.label) button.dataset.label = button.textContent;
+      button.textContent = label;
+      button._flashTimer = setTimeout(() => {
+        button.textContent = button.dataset.label;
+      }, ms);
+    };
     try {
       await navigator.clipboard.writeText(text);
-      const prev = button.textContent;
-      button.textContent = "Copied";
-      setTimeout(() => {
-        button.textContent = prev;
-      }, 1200);
-    } catch {
-      /* clipboard unavailable */
+      flash("Copied", 1200);
+      announce("Copied to the clipboard");
+    } catch (err) {
+      flash("Copy failed", 2400);
+      consoleError(
+        `Couldn't copy to the clipboard (${err?.message || "permission denied"}). Select the text in the editor and copy it instead.`,
+        "clipboard"
+      );
     }
   }
 
@@ -2548,11 +3108,13 @@
       const el = canvasEl.querySelector(`.entity-node[data-id="${resizeState.id}"]`);
       if (!node || !el) return;
       const nextW = Math.max(300, resizeState.startW + (e.clientX - resizeState.startX));
-      const nextH = Math.max(240, resizeState.startH + (e.clientY - resizeState.startY));
+      const nextH = Math.max(160, resizeState.startH + (e.clientY - resizeState.startY));
       node.width = nextW;
       node.height = nextH;
+      node.fixedHeight = true;
       el.style.width = `${nextW}px`;
       el.style.height = `${nextH}px`;
+      el.style.maxHeight = "";
       updateCanvasSurface();
       return;
     }
@@ -2583,6 +3145,7 @@
       document.body.classList.remove("is-resizing-node");
       resizeState = null;
       scheduleSaveWorkspace();
+      scheduleHistoryCommit();
       return;
     }
     if (!moveState) return;
@@ -2591,6 +3154,7 @@
     document.body.classList.remove("is-dragging-node");
     moveState = null;
     scheduleSaveWorkspace();
+    scheduleHistoryCommit();
   });
 
   canvasEl.addEventListener("dragover", (e) => {
@@ -2635,8 +3199,8 @@
 
   clearBtn.addEventListener("click", () => {
     if (!nodes.length) return;
+    checkpoint();
     const count = `${nodes.length} block${nodes.length === 1 ? "" : "s"}`;
-    if (!window.confirm(`Remove all ${count} from the canvas?`)) return;
     nodes = [];
     fieldQueries.clear();
     nodeTabs.clear();
@@ -2645,6 +3209,7 @@
     clearWorkspace();
     renderNodes();
     refreshQuery();
+    showUndoToast(`Cleared ${count} from the canvas`);
   });
 
   copyBtn.addEventListener("click", () => copyText(getDqlText(), copyBtn));
@@ -2667,6 +3232,8 @@
     );
     const drafts = window.DQLQueryParser.toNodes(operations, nextSchema);
 
+    checkpoint();
+    const replaced = nodes.length;
     schema = nextSchema;
     schemaIsSample = false;
     nodes = [];
@@ -2737,6 +3304,13 @@
       source
     );
     (warnings || []).forEach((w) => consoleWarn(w, source));
+    if (replaced) {
+      showUndoToast(
+        `Replaced ${replaced} block${replaced === 1 ? "" : "s"} with ${nodes.length} from the query`
+      );
+    } else {
+      commitHistory();
+    }
     return `Loaded ${nodes.length} query block${nodes.length === 1 ? "" : "s"}`;
   }
 
@@ -2752,12 +3326,15 @@
     const text = getDqlText().trim();
     if (!text) {
       if (soft) return false;
+      checkpoint();
+      const count = nodes.length;
       nodes = [];
       selectedNodeId = null;
       clearDqlDirty();
       renderNodes();
       refreshQuery();
       consoleInfo("Cleared canvas from empty DQL editor", "editor");
+      if (count) showUndoToast(`The query was empty, so the canvas was cleared (${count} block${count === 1 ? "" : "s"})`);
       return true;
     }
 
@@ -2780,7 +3357,8 @@
       importQueryText(text, { source: "editor" });
       return true;
     } catch (err) {
-      // Soft blur: stay dirty quietly while the user is still typing.
+      // The marker shows either way; soft blur stays quiet in the console while the user is still typing.
+      markDqlError(err);
       if (!soft) consoleError(err.message || String(err), "editor");
       if (!dqlDirty) {
         dqlDirty = true;
@@ -2834,8 +3412,13 @@
     schemaStatus.className = `modal-status${kind ? ` is-${kind}` : ""}`;
   }
 
-  /** Swap the active schema and reset the canvas (blocks reference old types). */
-  function setSchema(next, { isSample = false } = {}) {
+  /**
+   * Swap the active schema and reset the canvas (blocks reference old types).
+   * Undo brings back the previous schema together with its blocks.
+   */
+  function setSchema(next, { isSample = false, message = "" } = {}) {
+    checkpoint();
+    const cleared = nodes.length;
     schema = next;
     schemaIsSample = isSample;
     nodes = [];
@@ -2844,6 +3427,11 @@
     renderDock();
     renderNodes();
     refreshQuery();
+    if (cleared) {
+      showUndoToast(`${message}; cleared ${cleared} block${cleared === 1 ? "" : "s"}`);
+    } else {
+      commitHistory();
+    }
   }
 
   function applyLoadedSchema(next, sourceLabel) {
@@ -2853,18 +3441,10 @@
       consoleError("Schema parsed, but it contains no usable object types.", "schema");
       return;
     }
-    if (!confirmCanvasReset()) return;
-    setSchema(next, { isSample: false });
-    consoleInfo(`Loaded ${count} entit${count === 1 ? "y" : "ies"} from ${sourceLabel}`, "schema");
+    const message = `Loaded ${count} entit${count === 1 ? "y" : "ies"} from ${sourceLabel}`;
     closeSchemaModal();
-  }
-
-  /** Switching schema empties the canvas — ask first if there is work on it. */
-  function confirmCanvasReset() {
-    if (!nodes.length) return true;
-    return window.confirm(
-      `Loading a schema clears the canvas (${nodes.length} block${nodes.length === 1 ? "" : "s"}). Continue?`
-    );
+    setSchema(next, { isSample: false, message });
+    consoleInfo(message, "schema");
   }
 
   function openSchemaModal() {
@@ -2926,10 +3506,9 @@
   });
 
   schemaSampleBtn.addEventListener("click", () => {
-    if (!confirmCanvasReset()) return;
-    setSchema(window.DQL_SCHEMA, { isSample: true });
-    consoleInfo("Switched to the built-in sample schema", "schema");
     closeSchemaModal();
+    setSchema(window.DQL_SCHEMA, { isSample: true, message: "Switched to the sample schema" });
+    consoleInfo("Switched to the built-in sample schema", "schema");
   });
 
   /* ---------- Resizable query pane ---------- */
@@ -2981,6 +3560,32 @@
     const current = workspaceEl.querySelector(".query-pane").offsetWidth;
     setQueryWidth(current + (e.key === "ArrowRight" ? 24 : -24));
     saveQueryWidth();
+  });
+
+  /* ---------- Help ---------- */
+
+  const helpBtn = document.getElementById("helpBtn");
+  const helpPanel = document.getElementById("helpPanel");
+  const helpWrap = document.getElementById("helpWrap");
+
+  function setHelpOpen(open) {
+    helpPanel.hidden = !open;
+    helpBtn.setAttribute("aria-expanded", String(open));
+  }
+
+  helpBtn.addEventListener("click", () => setHelpOpen(helpPanel.hidden));
+  document.addEventListener("click", (e) => {
+    if (!helpPanel.hidden && !helpWrap.contains(e.target)) setHelpOpen(false);
+  });
+  helpWrap.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || helpPanel.hidden) return;
+    e.stopPropagation();
+    setHelpOpen(false);
+    helpBtn.focus();
+  });
+
+  document.querySelectorAll(".mod-key").forEach((el) => {
+    el.textContent = MOD_KEY;
   });
 
   /* ---------- Theme ---------- */
@@ -3040,4 +3645,6 @@
   }
   initEditors();
   refreshQuery();
+  commitHistory();
+  updateHistoryButtons();
 })();
