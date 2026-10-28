@@ -4,123 +4,162 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DQL Builder</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script>
+    // Set the theme before first paint: saved choice, else the OS preference.
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem("dql-builder:theme"); } catch (e) {}
+      var dark = saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+      document.documentElement.dataset.theme = dark ? "dark" : "light";
+    })();
+  </script>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="grain" aria-hidden="true"></div>
-
   <div id="dql-builder" class="app">
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <h1>DQL Builder</h1>
       </div>
-      <p class="tagline">Per-parameter filters, nested edges, live DQL.</p>
-      <button type="button" id="loadSchemaBtn" class="btn-ghost">Load schema</button>
+      <div class="topbar-actions">
+        <span id="schemaLabel" class="schema-label" title="Active schema"></span>
+        <button type="button" id="loadSchemaBtn" class="btn">Load schema</button>
+        <button type="button" id="themeBtn" class="btn btn-square" aria-label="Switch to dark theme" title="Switch to dark theme">
+          <svg class="icon icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z" /></svg>
+          <svg class="icon icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+        </button>
+      </div>
     </header>
 
-    <main class="workspace">
-      <aside class="query-panel">
-        <div class="panel-label">
-          <span class="panel-title">
-            DQL
-            <span id="dqlDirtyBadge" class="dirty-badge" hidden>edited</span>
-          </span>
-          <div class="panel-actions">
-            <button type="button" id="applyDqlBtn" class="btn-ghost btn-apply" hidden title="Apply editor to canvas (Ctrl+Enter)">Apply</button>
-            <button type="button" id="revertDqlBtn" class="btn-ghost" hidden title="Discard editor changes">Revert</button>
-            <button type="button" id="copyBtn" class="btn-ghost" disabled>Copy</button>
+    <main class="workspace" id="workspace">
+      <section class="pane query-pane" aria-label="Query">
+        <div class="pane-head">
+          <h2 class="pane-title">
+            Query
+            <span id="dqlDirtyBadge" class="badge badge-warn" hidden>Unsaved</span>
+          </h2>
+          <div class="pane-actions">
+            <button type="button" id="revertDqlBtn" class="btn btn-quiet" hidden title="Discard editor changes">Revert</button>
+            <button type="button" id="applyDqlBtn" class="btn btn-primary" hidden title="Apply editor to canvas (Ctrl+Enter)">Apply</button>
+            <button type="button" id="copyBtn" class="btn" disabled>Copy</button>
           </div>
         </div>
+        <p id="dqlEditHint" class="editor-hint" hidden>
+          Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> or click Apply to update the canvas.
+        </p>
         <div id="dqlEditor" class="editor-host"></div>
-        <p id="dqlEditHint" class="editor-hint" hidden>Unsaved edits — <kbd>Ctrl</kbd>+<kbd>Enter</kbd> applies to the canvas, or click Apply.</p>
-        <div class="panel-label vars-label">
-          <span>Variables</span>
-          <button type="button" id="copyVarsBtn" class="btn-ghost" disabled>Copy</button>
+        <div class="pane-head pane-head-split">
+          <h2 class="pane-title">Variables</h2>
+          <div class="pane-actions">
+            <button type="button" id="copyVarsBtn" class="btn" disabled>Copy</button>
+          </div>
         </div>
         <div id="varsEditor" class="editor-host vars-host"></div>
-      </aside>
+      </section>
 
-      <div class="canvas-wrap">
-        <div class="panel-label">
-          <span>Canvas</span>
-          <div class="panel-actions">
+      <div
+        class="splitter"
+        id="splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize query panel"
+        tabindex="0"
+      ></div>
+
+      <section class="pane canvas-pane" aria-label="Canvas">
+        <div class="pane-head">
+          <h2 class="pane-title">
+            Canvas
+            <span id="blockCount" class="pane-meta"></span>
+          </h2>
+          <div class="pane-actions">
             <div class="entity-menu" id="entityMenuWrap">
-              <button type="button" id="addEntityBtn" class="btn-ghost btn-add-entity" aria-haspopup="true" aria-expanded="false">
-                + Add entity
+              <button type="button" id="addEntityBtn" class="btn btn-primary" aria-haspopup="true" aria-expanded="false">
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                Add entity
               </button>
-              <div id="entityMenu" class="entity-menu-panel" hidden role="menu" aria-label="Add entity"></div>
+              <div id="entityMenu" class="menu" hidden>
+                <input type="search" id="entitySearch" class="menu-search" placeholder="Search entities" spellcheck="false" autocomplete="off" aria-label="Search entities" />
+                <div id="entityMenuList" class="menu-list" role="listbox" aria-label="Entities"></div>
+              </div>
             </div>
-            <button type="button" id="clearBtn" class="btn-ghost">Clear</button>
+            <button type="button" id="clearBtn" class="btn btn-quiet">Clear</button>
           </div>
         </div>
+
         <div id="canvas" class="canvas" tabindex="0">
           <div id="canvasSurface" class="canvas-surface" aria-hidden="true"></div>
           <div class="canvas-empty" id="canvasEmpty">
-            Edit DQL on the left, or add an entity from the menu above.
-          </div>
-        </div>
-        <section class="builder-console" id="builderConsole" aria-label="Builder console">
-          <div class="console-toolbar">
-            <button type="button" id="consoleClearBtn" class="console-tool-btn" title="Clear console" aria-label="Clear console">
-              <span class="console-clear-icon" aria-hidden="true"></span>
-            </button>
-            <label class="console-filter">
-              <span class="console-filter-icon" aria-hidden="true"></span>
-              <input type="search" id="consoleFilter" placeholder="Filter" spellcheck="false" />
-            </label>
-            <select id="consoleLevel" class="console-level" title="Log level">
-              <option value="all">All levels</option>
-              <option value="error">Errors</option>
-              <option value="warn">Warnings</option>
-              <option value="info">Info</option>
-            </select>
-            <div class="console-counts" aria-live="polite">
-              <span class="console-count is-error" id="consoleErrorCount" title="Errors">
-                <span class="console-count-icon" aria-hidden="true"></span>
-                <span class="console-count-num">0</span>
-              </span>
-              <span class="console-count is-warn" id="consoleWarnCount" title="Warnings">
-                <span class="console-count-icon" aria-hidden="true"></span>
-                <span class="console-count-num">0</span>
-              </span>
+            <div class="empty-card">
+              <p class="empty-title">Start building a query</p>
+              <p class="empty-text">Add an entity to pick its fields, or type and paste DQL in the Query panel.</p>
+              <button type="button" id="emptyAddBtn" class="btn btn-primary">
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                Add entity
+              </button>
             </div>
           </div>
-          <div class="console-output" id="consoleOutput" role="log" aria-relevant="additions"></div>
+        </div>
+
+        <section class="console" id="builderConsole" aria-label="Console">
+          <div class="console-bar">
+            <button type="button" id="consoleToggle" class="console-toggle" aria-expanded="false" aria-controls="consoleBody">
+              <svg class="icon chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
+              Console
+              <span class="console-count is-error" id="consoleErrorCount" title="Errors" hidden>0</span>
+              <span class="console-count is-warn" id="consoleWarnCount" title="Warnings" hidden>0</span>
+            </button>
+            <span id="consoleLast" class="console-last"></span>
+            <div class="console-tools" id="consoleTools" hidden>
+              <select id="consoleLevel" class="select-sm" aria-label="Show messages">
+                <option value="all">All messages</option>
+                <option value="error">Errors</option>
+                <option value="warn">Warnings</option>
+                <option value="info">Info</option>
+              </select>
+              <button type="button" id="consoleClearBtn" class="btn btn-quiet btn-sm">Clear</button>
+            </div>
+          </div>
+          <div class="console-body" id="consoleBody" role="log" aria-relevant="additions" hidden></div>
         </section>
-      </div>
+      </section>
     </main>
   </div>
 
   <div id="schemaModal" class="modal-overlay" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="schemaModalTitle">
       <header class="modal-head">
-        <h2 id="schemaModalTitle">Load Dgraph schema</h2>
-        <button type="button" id="schemaCloseBtn" class="modal-close" aria-label="Close">×</button>
+        <h2 id="schemaModalTitle">Load schema</h2>
+        <button type="button" id="schemaCloseBtn" class="btn-icon" aria-label="Close">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+        </button>
       </header>
-      <p class="modal-hint">
-        Fetch from a Dgraph Alpha (runs <code>schema { }</code>), or paste the JSON
-        result of that query from Ratel. Example:
-        <code>http://localhost:8080</code>. CORS must allow this origin.
-      </p>
-      <div class="modal-row">
-        <input type="url" id="schemaUrl" placeholder="http://localhost:8080" spellcheck="false" />
-        <button type="button" id="schemaFetchBtn" class="btn-solid">Fetch</button>
+
+      <div class="modal-body">
+        <label class="form-label" for="schemaUrl">From a Dgraph Alpha endpoint</label>
+        <div class="modal-row">
+          <input type="url" id="schemaUrl" class="input" placeholder="http://localhost:8080" spellcheck="false" />
+          <button type="button" id="schemaFetchBtn" class="btn btn-primary">Fetch</button>
+        </div>
+        <p class="form-help">Runs <code>schema { }</code>. The server must allow requests from this page (CORS).</p>
+
+        <div class="divider"><span>or</span></div>
+
+        <label class="form-label" for="schemaText">Paste the JSON result of <code>schema { }</code></label>
+        <textarea
+          id="schemaText"
+          class="input"
+          placeholder='{&#10;  "Schema": [&#10;    { "Predicate": "name", "Type": "string" },&#10;    { "Predicate": "posts", "Type": "uid", "List": true }&#10;  ],&#10;  "Types": [&#10;    {&#10;      "Name": "User",&#10;      "Fields": [{ "Name": "name" }, { "Name": "posts" }]&#10;    }&#10;  ]&#10;}'
+          spellcheck="false"
+        ></textarea>
+        <p id="schemaStatus" class="modal-status" role="status"></p>
       </div>
-      <p class="modal-divider"><span>or paste <code>schema { }</code> JSON</span></p>
-      <textarea
-        id="schemaText"
-        placeholder='{&#10;  "Schema": [&#10;    { "Predicate": "name", "Type": "string" },&#10;    { "Predicate": "posts", "Type": "uid", "List": true }&#10;  ],&#10;  "Types": [&#10;    {&#10;      "Name": "User",&#10;      "Fields": [{ "Name": "name" }, { "Name": "posts" }]&#10;    }&#10;  ]&#10;}'
-        spellcheck="false"
-      ></textarea>
-      <div class="modal-actions">
-        <button type="button" id="schemaSampleBtn" class="btn-ghost">Reset to sample</button>
-        <span id="schemaStatus" class="modal-status" role="status"></span>
-        <button type="button" id="schemaApplyBtn" class="btn-solid">Apply</button>
-      </div>
+
+      <footer class="modal-foot">
+        <button type="button" id="schemaSampleBtn" class="btn btn-quiet">Use sample schema</button>
+        <button type="button" id="schemaApplyBtn" class="btn btn-primary">Apply JSON</button>
+      </footer>
     </div>
   </div>
 

@@ -36,12 +36,24 @@
   const revertDqlBtn = document.getElementById("revertDqlBtn");
   const dqlDirtyBadge = document.getElementById("dqlDirtyBadge");
   const dqlEditHint = document.getElementById("dqlEditHint");
-  const consoleOutputEl = document.getElementById("consoleOutput");
-  const consoleFilterEl = document.getElementById("consoleFilter");
+  const entitySearchEl = document.getElementById("entitySearch");
+  const entityMenuListEl = document.getElementById("entityMenuList");
+  const emptyAddBtn = document.getElementById("emptyAddBtn");
+  const blockCountEl = document.getElementById("blockCount");
+  const schemaLabelEl = document.getElementById("schemaLabel");
+  const workspaceEl = document.getElementById("workspace");
+  const splitterEl = document.getElementById("splitter");
+  const consoleOutputEl = document.getElementById("consoleBody");
+  const consoleToggleBtn = document.getElementById("consoleToggle");
+  const consoleToolsEl = document.getElementById("consoleTools");
+  const consoleLastEl = document.getElementById("consoleLast");
   const consoleLevelEl = document.getElementById("consoleLevel");
   const consoleClearBtn = document.getElementById("consoleClearBtn");
   const consoleErrorCountEl = document.getElementById("consoleErrorCount");
   const consoleWarnCountEl = document.getElementById("consoleWarnCount");
+
+  const ICON_CLOSE =
+    '<svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>';
 
   /**
    * Each canvas node is one DQL query block.
@@ -70,7 +82,6 @@
   let nodeSeq = 0;
   let paramSeq = 0;
   let filterSeq = 0;
-  const animatedNodes = new Set();
   /** True when `schema` came from the built-in sample (reload picks up schema.js edits). */
   let schemaIsSample = true;
 
@@ -135,7 +146,6 @@
       paramSeq = Number(data.paramSeq) || 0;
       filterSeq = Number(data.filterSeq) || 0;
       nodes.forEach((n) => {
-        animatedNodes.add(n.id);
         (n.rootFilter?.conditions || []).forEach((c) => {
           if (!c.id) c.id = filterUid();
         });
@@ -215,28 +225,36 @@
   let consoleSeq = 0;
 
   function applyConsoleFilters() {
-    const q = (consoleFilterEl.value || "").trim().toLowerCase();
     const level = consoleLevelEl.value || "all";
     consoleOutputEl.querySelectorAll(".console-row").forEach((row) => {
-      const rowLevel = row.dataset.level;
-      const text = row.dataset.text || "";
-      const levelOk = level === "all" || rowLevel === level;
-      const textOk = !q || text.includes(q);
-      row.classList.toggle("is-hidden", !(levelOk && textOk));
+      row.classList.toggle("is-hidden", level !== "all" && row.dataset.level !== level);
     });
   }
 
   function updateConsoleCounts() {
     const errors = consoleEntries.filter((e) => e.level === "error").length;
     const warns = consoleEntries.filter((e) => e.level === "warn").length;
-    consoleErrorCountEl.querySelector(".console-count-num").textContent = String(errors);
-    consoleWarnCountEl.querySelector(".console-count-num").textContent = String(warns);
+    consoleErrorCountEl.textContent = String(errors);
+    consoleErrorCountEl.hidden = !errors;
+    consoleErrorCountEl.title = `${errors} error${errors === 1 ? "" : "s"}`;
+    consoleWarnCountEl.textContent = String(warns);
+    consoleWarnCountEl.hidden = !warns;
+    consoleWarnCountEl.title = `${warns} warning${warns === 1 ? "" : "s"}`;
+  }
+
+  function setConsoleOpen(open) {
+    consoleOutputEl.hidden = !open;
+    consoleToolsEl.hidden = !open;
+    consoleLastEl.hidden = open;
+    consoleToggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
   }
 
   function renderConsoleEmpty() {
     if (consoleEntries.length) return;
     consoleOutputEl.innerHTML =
-      '<p class="console-empty">Console cleared — parse and build messages will appear here.</p>';
+      '<p class="console-empty">No messages. Parse and build messages appear here.</p>';
+    consoleLastEl.textContent = "";
   }
 
   function clearConsole() {
@@ -267,19 +285,22 @@
     const row = document.createElement("div");
     row.className = `console-row is-${entry.level}`;
     row.dataset.level = entry.level;
-    row.dataset.text = `${entry.message} ${entry.source}`.toLowerCase();
     row.innerHTML = `
-      <span class="console-row-icon" aria-hidden="true"></span>
+      <span class="console-row-level"></span>
       <span class="console-row-msg"></span>
       <span class="console-row-source"></span>
     `;
+    row.querySelector(".console-row-level").textContent = entry.level;
     row.querySelector(".console-row-msg").textContent = entry.message;
     row.querySelector(".console-row-source").textContent = entry.source;
     consoleOutputEl.appendChild(row);
     consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
+    consoleLastEl.textContent = entry.message;
 
     updateConsoleCounts();
     applyConsoleFilters();
+    // Errors need attention — surface them instead of hiding in a collapsed bar.
+    if (entry.level === "error") setConsoleOpen(true);
   }
 
   function consoleError(message, source) {
@@ -295,8 +316,8 @@
   }
 
   consoleClearBtn.addEventListener("click", clearConsole);
-  consoleFilterEl.addEventListener("input", applyConsoleFilters);
   consoleLevelEl.addEventListener("change", applyConsoleFilters);
+  consoleToggleBtn.addEventListener("click", () => setConsoleOpen(consoleOutputEl.hidden));
   renderConsoleEmpty();
 
   function setOutputs(dql, vars) {
@@ -317,7 +338,7 @@
     ta.spellcheck = false;
     ta.style.cssText =
       "width:100%;height:100%;border:none;outline:none;resize:none;padding:1rem;" +
-      "font-family:var(--mono);font-size:0.82rem;line-height:1.55;color:var(--ink);background:transparent;";
+      "font-family:var(--mono);font-size:12.5px;line-height:1.6;color:var(--text);background:transparent;";
     host.appendChild(ta);
     return ta;
   }
@@ -345,36 +366,77 @@
     });
 
     window.require(["vs/editor/editor.main"], () => {
+      // One quiet color for all bracket levels instead of a rainbow.
+      const brackets = (color) =>
+        Object.fromEntries([1, 2, 3, 4, 5, 6].map((i) => [`editorBracketHighlight.foreground${i}`, color]));
+
       monaco.editor.defineTheme("dql-dark", {
         base: "vs-dark",
         inherit: true,
         rules: [
-          { token: "keyword", foreground: "3dd68c", fontStyle: "bold" },
-          { token: "string", foreground: "fdd663" },
+          { token: "keyword", foreground: "3dd68c" },
+          { token: "string", foreground: "f2c94c" },
           { token: "number", foreground: "8ab4f8" },
-          { token: "comment", foreground: "9aa0a6", fontStyle: "italic" },
+          { token: "comment", foreground: "686b74", fontStyle: "italic" },
         ],
         colors: {
-          "editor.background": "#202124",
-          "editor.foreground": "#e8eaed",
-          "editor.lineHighlightBackground": "#292a2d",
-          "editorLineNumber.foreground": "#5f6368",
-          "editorGutter.background": "#202124",
-          "editorCursor.foreground": "#e8eaed",
-          "editor.selectionBackground": "#3c4043",
-          "editor.inactiveSelectionBackground": "#303134",
-          "editorWidget.background": "#292a2d",
-          "editorWidget.border": "#3c4043",
-          "input.background": "#1a1b1e",
-          "dropdown.background": "#292a2d",
+          "editor.background": "#1a1b1f",
+          "editor.foreground": "#e4e5e9",
+          "editor.lineHighlightBackground": "#212227",
+          "editor.lineHighlightBorder": "#00000000",
+          "editorLineNumber.foreground": "#4a4d55",
+          "editorLineNumber.activeForeground": "#9a9ca5",
+          "editorGutter.background": "#1a1b1f",
+          "editorCursor.foreground": "#e4e5e9",
+          "editor.selectionBackground": "#3b3e46",
+          "editor.inactiveSelectionBackground": "#2a2c32",
+          "editorIndentGuide.background1": "#2c2e34",
+          "editorWidget.background": "#212227",
+          "editorWidget.border": "#3b3e46",
+          "input.background": "#111215",
+          "dropdown.background": "#212227",
+          "scrollbarSlider.background": "#3b3e4680",
+          "scrollbarSlider.hoverBackground": "#3b3e46",
+          ...brackets("#9a9ca5"),
+        },
+      });
+
+      monaco.editor.defineTheme("dql-light", {
+        base: "vs",
+        inherit: true,
+        rules: [
+          { token: "keyword", foreground: "15803d" },
+          { token: "string", foreground: "a15c00" },
+          { token: "number", foreground: "1d5fc2" },
+          { token: "comment", foreground: "8b909a", fontStyle: "italic" },
+        ],
+        colors: {
+          "editor.background": "#ffffff",
+          "editor.foreground": "#1c1e23",
+          "editor.lineHighlightBackground": "#f7f8fa",
+          "editor.lineHighlightBorder": "#00000000",
+          "editorLineNumber.foreground": "#b4b8c0",
+          "editorLineNumber.activeForeground": "#5d626d",
+          "editorGutter.background": "#ffffff",
+          "editorCursor.foreground": "#1c1e23",
+          "editor.selectionBackground": "#d9dde4",
+          "editor.inactiveSelectionBackground": "#eceef2",
+          "editorIndentGuide.background1": "#e2e4e9",
+          "editorWidget.background": "#ffffff",
+          "editorWidget.border": "#cfd3da",
+          "input.background": "#ffffff",
+          "dropdown.background": "#ffffff",
+          "scrollbarSlider.background": "#cfd3da80",
+          "scrollbarSlider.hoverBackground": "#cfd3da",
+          ...brackets("#5d626d"),
         },
       });
 
       const common = {
-        theme: "dql-dark",
+        theme: monacoThemeName(),
         minimap: { enabled: false },
         automaticLayout: true,
-        fontFamily: "IBM Plex Mono, ui-monospace, monospace",
+        fontFamily: 'ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace',
         fontSize: 12.5,
         lineHeight: 20,
         scrollBeyondLastLine: false,
@@ -384,6 +446,7 @@
         scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
         padding: { top: 12, bottom: 12 },
         wordWrap: "on",
+        guides: { indentation: false },
       };
 
       // GraphQL grammar is the closest built-in match for DQL.
@@ -768,11 +831,22 @@
   }
 
   function updateEmptyState() {
-    canvasEmptyEl.classList.toggle("hidden", nodes.length > 0);
-    if (!nodes.length) {
-      canvasEmptyEl.textContent =
-        "Edit DQL on the left, or add an entity from + Add entity above.";
-    }
+    canvasEmptyEl.hidden = nodes.length > 0;
+    blockCountEl.textContent = nodes.length
+      ? `${nodes.length} block${nodes.length === 1 ? "" : "s"}`
+      : "";
+    clearBtn.disabled = !nodes.length;
+  }
+
+  function updateSchemaLabel() {
+    const count = Object.keys(schema || {}).length;
+    const source = schemaIsSample ? "Sample schema" : "Custom schema";
+    schemaLabelEl.textContent = `${source} · ${count} entit${count === 1 ? "y" : "ies"}`;
+  }
+
+  /** Lift dark schema colors so the type dot stays visible on dark surfaces. */
+  function dotColor(color) {
+    return `color-mix(in srgb, ${color || "#888"} 75%, var(--dot-mix))`;
   }
 
   function stopDragPropagation(el) {
@@ -894,131 +968,255 @@
   }
 
   function closeEntityMenu() {
-    if (!entityMenuEl || !addEntityBtn) return;
+    if (entityMenuEl.hidden) return;
     entityMenuEl.hidden = true;
     addEntityBtn.setAttribute("aria-expanded", "false");
   }
 
+  function openEntityMenu() {
+    entityMenuEl.hidden = false;
+    addEntityBtn.setAttribute("aria-expanded", "true");
+    entitySearchEl.value = "";
+    renderEntityMenu();
+    entitySearchEl.focus();
+  }
+
   function toggleEntityMenu() {
-    if (!entityMenuEl || !addEntityBtn) return;
-    const open = entityMenuEl.hidden;
-    entityMenuEl.hidden = !open;
-    addEntityBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (entityMenuEl.hidden) openEntityMenu();
+    else closeEntityMenu();
   }
 
   function renderDock() {
     renderEntityMenu();
+    updateSchemaLabel();
+  }
+
+  function addEntityFromMenu(typeName) {
+    closeEntityMenu();
+    const pos = findFreePosition(DEFAULT_NODE_W, DEFAULT_NODE_H);
+    placeEntity(typeName, pos.x, pos.y);
+    scrollNodeIntoView(selectedNodeId);
+  }
+
+  function setActiveMenuItem(item) {
+    entityMenuListEl.querySelectorAll(".menu-item").forEach((el) => {
+      const active = el === item;
+      el.classList.toggle("is-active", active);
+      el.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    item?.scrollIntoView({ block: "nearest" });
   }
 
   function renderEntityMenu() {
-    if (!entityMenuEl) return;
-    entityMenuEl.innerHTML = "";
-    const list = document.createElement("div");
-    list.className = "entity-menu-list";
+    const q = entitySearchEl.value.trim().toLowerCase();
+    entityMenuListEl.innerHTML = "";
 
-    Object.entries(schema).forEach(([typeName, def]) => {
+    const entries = Object.entries(schema).filter(
+      ([typeName]) => !q || typeName.toLowerCase().includes(q)
+    );
+    if (!entries.length) {
+      entityMenuListEl.innerHTML = '<p class="menu-empty">No matching entities</p>';
+      return;
+    }
+
+    entries.forEach(([typeName, def]) => {
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "entity-menu-item";
-      item.role = "menuitem";
+      item.className = "menu-item";
+      item.setAttribute("role", "option");
+      item.tabIndex = -1;
       item.draggable = true;
       item.dataset.type = typeName;
-      item.title = `Add ${typeName} query block — drag onto canvas or click`;
+      item.title = "Click to add, or drag onto the canvas";
+      const count = def.fields?.length || 0;
       item.innerHTML = `
-        <span class="palette-dot" style="background:${def.color}"></span>
-        <span class="entity-menu-name">${typeName}</span>
-        <span class="entity-menu-hint">+</span>
+        <span class="dot" style="background:${dotColor(def.color)}"></span>
+        <span class="menu-item-name">${escapeAttr(typeName)}</span>
+        <span class="menu-item-meta">${count} field${count === 1 ? "" : "s"}</span>
       `;
-      item.addEventListener("click", () => {
-        closeEntityMenu();
-        const pos = findFreePosition(DEFAULT_NODE_W, DEFAULT_NODE_H);
-        placeEntity(typeName, pos.x, pos.y);
-      });
+      item.addEventListener("click", () => addEntityFromMenu(typeName));
+      item.addEventListener("mousemove", () => setActiveMenuItem(item));
       item.addEventListener("dragstart", (e) => {
         dragPaletteType = typeName;
-        item.classList.add("dragging");
         e.dataTransfer.effectAllowed = "copy";
         e.dataTransfer.setData("text/plain", typeName);
       });
       item.addEventListener("dragend", () => {
         dragPaletteType = null;
-        item.classList.remove("dragging");
       });
-      list.appendChild(item);
+      entityMenuListEl.appendChild(item);
     });
 
-    entityMenuEl.appendChild(list);
+    setActiveMenuItem(entityMenuListEl.querySelector(".menu-item"));
+  }
+
+  entitySearchEl.addEventListener("input", renderEntityMenu);
+  entitySearchEl.addEventListener("keydown", (e) => {
+    const items = [...entityMenuListEl.querySelectorAll(".menu-item")];
+    const current = items.findIndex((el) => el.classList.contains("is-active"));
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!items.length) return;
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      setActiveMenuItem(items[(current + step + items.length) % items.length]);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const item = items[current] || items[0];
+      if (item) addEntityFromMenu(item.dataset.type);
+    } else if (e.key === "Escape") {
+      closeEntityMenu();
+      addEntityBtn.focus();
+    }
+  });
+
+  function scrollNodeIntoView(id) {
+    const el = id && canvasEl.querySelector(`.entity-node[data-id="${id}"]`);
+    if (!el) return;
+    const x = el.offsetLeft;
+    const y = el.offsetTop;
+    const viewL = canvasEl.scrollLeft;
+    const viewT = canvasEl.scrollTop;
+    const fits =
+      x >= viewL &&
+      y >= viewT &&
+      x + Math.min(el.offsetWidth, canvasEl.clientWidth) <= viewL + canvasEl.clientWidth &&
+      y + 40 <= viewT + canvasEl.clientHeight;
+    if (!fits) {
+      canvasEl.scrollTo({ left: Math.max(0, x - 24), top: Math.max(0, y - 24), behavior: "smooth" });
+    }
   }
 
   /* ---------- Query block rendering ---------- */
 
-  function renderFilterValueControls(cond, params) {
-    const unary = isUnaryFilter(cond.func);
-    if (unary) return `<span class="filter-value-blank">—</span>`;
+  /** Transient per-block field search text (not persisted). */
+  const fieldQueries = new Map();
 
-    const mode = cond.valueMode === "param" ? "param" : "literal";
-    const modeOpts = optionsHtml(
-      [
-        { value: "literal", label: "literal" },
-        { value: "param", label: "$param" },
-      ],
-      mode
-    );
+  /** Transient per-block active tab (not persisted). */
+  const nodeTabs = new Map();
+  const NODE_TABS = [
+    { id: "fields", label: "Fields" },
+    { id: "filter", label: "Filter" },
+    { id: "variables", label: "Variables" },
+    { id: "settings", label: "Settings" },
+  ];
 
-    if (mode === "param") {
-      const paramOpts = (params || []).map((p) => ({
-        value: p.name,
-        label: `$${p.name}`,
-      }));
+  function renderNodeTabs(node, activeTab) {
+    const counts = {
+      fields: countSelected(node.selection),
+      filter: ensureFilterGroup(node.rootFilter).conditions.length,
+      variables: (node.params || []).length,
+    };
+    return NODE_TABS.map((tab) => {
+      const active = tab.id === activeTab;
+      const count = counts[tab.id];
       return `
-        <select class="filter-value-mode" title="Value source">${modeOpts}</select>
-        <select class="filter-param" title="Parameter">${optionsHtml(
-          paramOpts.length ? paramOpts : [{ value: "", label: "— add a $param" }],
-          cond.paramName || ""
-        )}</select>
+        <button
+          type="button"
+          class="node-tab"
+          role="tab"
+          id="${node.id}-tab-${tab.id}"
+          data-tab="${tab.id}"
+          aria-controls="${node.id}-panel-${tab.id}"
+          aria-selected="${active}"
+          tabindex="${active ? 0 : -1}"
+        >${tab.label}${count ? `<span class="tab-count">${count}</span>` : ""}</button>
+      `;
+    }).join("");
+  }
+
+  function nodePanel(node, tabId, activeTab, html) {
+    return `
+      <div
+        class="node-panel"
+        role="tabpanel"
+        id="${node.id}-panel-${tabId}"
+        data-panel="${tabId}"
+        aria-labelledby="${node.id}-tab-${tabId}"
+        ${tabId === activeTab ? "" : "hidden"}
+      >${html}</div>
+    `;
+  }
+
+  function renderFilterValueControls(cond, params) {
+    if (isUnaryFilter(cond.func)) {
+      return `<span class="filter-value-blank" title="${escapeAttr(cond.func)} takes no value">No value needed</span>`;
+    }
+
+    const isParam = cond.valueMode === "param";
+    const toggle = `
+      <button
+        type="button"
+        class="filter-value-mode"
+        aria-pressed="${isParam}"
+        title="${isParam ? "Using a variable. Click to type a value instead." : "Use a variable instead of a value"}"
+      >$</button>
+    `;
+
+    if (isParam) {
+      const paramOpts = (params || []).map((p) => ({ value: p.name, label: `$${p.name}` }));
+      return `
+        <div class="filter-value">
+          ${toggle}
+          <select class="filter-param" aria-label="Variable">${optionsHtml(
+            paramOpts.length ? paramOpts : [{ value: "", label: "No variables" }],
+            cond.paramName || ""
+          )}</select>
+        </div>
       `;
     }
 
     return `
-      <select class="filter-value-mode" title="Value source">${modeOpts}</select>
-      <input type="text" class="filter-literal" value="${escapeAttr(cond.literal || "")}" placeholder="value" spellcheck="false" title="Literal value" />
+      <div class="filter-value">
+        ${toggle}
+        <input type="text" class="filter-literal" value="${escapeAttr(cond.literal || "")}" placeholder="value" spellcheck="false" aria-label="Value" />
+      </div>
     `;
   }
 
-  function renderFilterGroupPanel(group, typeName, params, { edgePath = "", compact = false } = {}) {
+  function renderFilterGroupPanel(group, typeName, params, { edgePath = "", title = "", emptyText = "" } = {}) {
     const g = ensureFilterGroup(group);
     const preds = scalarOptionsForType(typeName);
     const rows = g.conditions
-      .map((cond) => {
-        const unary = isUnaryFilter(cond.func);
-        return `
+      .map(
+        (cond) => `
           <div class="filter-row" data-filter-id="${cond.id}">
-            <select class="filter-func" title="Filter function">${optionsHtml(FILTER_FUNCS, cond.func || "eq")}</select>
-            <select class="filter-predicate" title="Predicate">${optionsHtml(
+            <select class="filter-predicate" aria-label="Predicate">${optionsHtml(
               preds.length ? preds : [{ value: "", label: "—" }],
               cond.predicate || ""
             )}</select>
+            <select class="filter-func" aria-label="Function">${optionsHtml(FILTER_FUNCS, cond.func || "eq")}</select>
             ${renderFilterValueControls(cond, params)}
-            <button type="button" class="filter-remove" title="Remove filter" aria-label="Remove filter">×</button>
+            <button type="button" class="btn-icon is-danger filter-remove" title="Remove condition" aria-label="Remove condition">${ICON_CLOSE}</button>
           </div>
-        `;
-      })
+        `
+      )
       .join("");
 
-    const cls = compact ? "filter-panel is-edge" : "filter-panel is-root";
-    return `
-      <div class="${cls}" data-edge-path="${escapeAttr(edgePath)}">
-        <div class="filter-panel-head">
-          <span class="filter-panel-label">@filter</span>
-          <div class="filter-op-toggle" role="group" aria-label="Combine filters with">
-            <button type="button" class="filter-op-btn${g.op !== "OR" ? " active" : ""}" data-op="AND">AND</button>
-            <button type="button" class="filter-op-btn${g.op === "OR" ? " active" : ""}" data-op="OR">OR</button>
+    const opToggle =
+      g.conditions.length > 1
+        ? `
+          <div class="segmented" role="group" aria-label="Combine conditions with">
+            <button type="button" class="filter-op-btn${g.op !== "OR" ? " active" : ""}" data-op="AND" title="Match all conditions">AND</button>
+            <button type="button" class="filter-op-btn${g.op === "OR" ? " active" : ""}" data-op="OR" title="Match any condition">OR</button>
           </div>
-          <button type="button" class="btn-mini add-filter">+ Add</button>
+        `
+        : "";
+
+    return `
+      <div class="filter-panel${edgePath ? " is-edge" : ""}" data-edge-path="${escapeAttr(edgePath)}">
+        <div class="section-head">
+          ${title ? `<span class="section-title">${escapeAttr(title)}</span>` : ""}
+          ${opToggle}
+          <button type="button" class="btn btn-quiet btn-sm push add-filter">+ Add condition</button>
         </div>
-        ${rows || '<p class="filter-empty">No conditions</p>'}
+        ${rows || (emptyText ? `<p class="section-empty">${escapeAttr(emptyText)}</p>` : "")}
       </div>
     `;
+  }
+
+  function fieldTypeLabel(field) {
+    if (field.kind !== "object" || !field.ofType) return field.type;
+    return String(field.type || "").startsWith("[") ? `[${field.ofType}]` : field.ofType;
   }
 
   function renderFieldTree(typeName, selection, path, depth, aliases, node) {
@@ -1031,40 +1229,45 @@
         const key = pathKey(fieldPath);
         const checked = isSelected(selection, fieldPath);
         const isObject = field.kind === "object";
-        const objectClass = isObject ? " is-object" : "";
+        const label = fieldDisplayName(field.name);
 
         let edgeFilterHtml = "";
         let nestedHtml = "";
+        let edgeFilterBtn = "";
         if (isObject && checked && field.ofType && schema[field.ofType] && depth < 8) {
-          const edgeGroup = node.edgeFilters?.[key] || emptyFilterGroup();
-          edgeFilterHtml = renderFilterGroupPanel(edgeGroup, field.ofType, node.params, {
-            edgePath: key,
-            compact: true,
-          });
+          const edgeGroup = node.edgeFilters?.[key];
+          if (edgeGroup?.conditions?.length) {
+            edgeFilterHtml = renderFilterGroupPanel(edgeGroup, field.ofType, node.params, {
+              edgePath: key,
+              title: `Filter ${label}`,
+            });
+          } else {
+            edgeFilterBtn = `<button type="button" class="field-filter-btn add-edge-filter" data-edge-path="${escapeAttr(key)}" title="Filter the ${escapeAttr(label)} edge">+ Filter</button>`;
+          }
           nestedHtml = `
-            <ul class="nested-fields" data-depth="${depth + 1}">
+            <ul class="nested-fields">
               ${renderFieldTree(field.ofType, selection, fieldPath, depth + 1, aliases, node)}
             </ul>
           `;
         }
 
-        const aliasValue = aliases[key] || "";
         const aliasHtml = checked
           ? `<input
               type="text"
               class="alias-input"
               data-alias-path="${escapeAttr(encodePath(fieldPath))}"
-              value="${escapeAttr(aliasValue)}"
+              value="${escapeAttr(aliases[key] || "")}"
               placeholder="alias"
               spellcheck="false"
-              title="Alias — result key for this predicate"
+              aria-label="Alias for ${escapeAttr(label)}"
+              title="Alias: the key this predicate gets in the result"
             />`
-          : `<span class="field-type" title="${escapeAttr(field.type)}">${field.type}</span>`;
+          : "";
 
-        const label = fieldDisplayName(field.name);
+        const typeLabel = fieldTypeLabel(field);
         return `
-          <li>
-            <div class="field-row${objectClass}" style="padding-left:${0.35 + depth * 0.4}rem">
+          <li class="field-item" data-name="${escapeAttr(label.toLowerCase())}">
+            <div class="field-row${isObject ? " is-object" : ""}${checked ? " is-checked" : ""}">
               <label class="field-check">
                 <input
                   type="checkbox"
@@ -1076,6 +1279,8 @@
                 <span class="field-name" title="${escapeAttr(field.name)}">${escapeAttr(label)}</span>
               </label>
               ${aliasHtml}
+              ${edgeFilterBtn}
+              <span class="field-type" title="${escapeAttr(typeLabel)}">${escapeAttr(typeLabel)}</span>
             </div>
             ${edgeFilterHtml}
             ${nestedHtml}
@@ -1083,6 +1288,47 @@
         `;
       })
       .join("");
+  }
+
+  /** Hide field rows that don't match the block's search, keeping ancestors of matches. */
+  function applyFieldSearch(nodeEl, query) {
+    const q = String(query || "").trim().toLowerCase();
+    const list = nodeEl.querySelector(".field-list");
+    if (!list) return;
+
+    const filterList = (ul) => {
+      let any = false;
+      [...ul.children].forEach((li) => {
+        if (!li.classList.contains("field-item")) return;
+        const nested = li.querySelector(":scope > .nested-fields");
+        const childMatch = nested ? filterList(nested) : false;
+        const visible = !q || childMatch || (li.dataset.name || "").includes(q);
+        li.hidden = !visible;
+        any = any || visible;
+      });
+      return any;
+    };
+
+    const any = filterList(list);
+    let empty = nodeEl.querySelector(".field-empty");
+    if (!any) {
+      if (!empty) {
+        empty = document.createElement("p");
+        empty.className = "field-empty";
+        list.after(empty);
+      }
+      empty.textContent = `No fields match "${String(query).trim()}"`;
+    } else if (empty) {
+      empty.remove();
+    }
+  }
+
+  function countSelected(selection) {
+    if (!selection || typeof selection !== "object") return 0;
+    return Object.values(selection).reduce(
+      (sum, v) => sum + 1 + (v && typeof v === "object" ? countSelected(v) : 0),
+      0
+    );
   }
 
   function optionsHtml(items, selected) {
@@ -1093,73 +1339,93 @@
     return list
       .map(
         (item) =>
-          `<option value="${item.value}" ${item.value === selected ? "selected" : ""}>${item.label}</option>`
+          `<option value="${escapeAttr(item.value)}" ${item.value === selected ? "selected" : ""}>${escapeAttr(item.label)}</option>`
       )
       .join("");
   }
 
   function renderParamsSection(node) {
+    const typeOpts = PARAM_TYPES.map((t) => ({ value: t, label: t }));
     const rows = (node.params || [])
-      .map((param) => {
-        const typeOpts = PARAM_TYPES.map((t) => ({ value: t, label: t }));
-        return `
-          <div class="param-card" data-param-id="${param.id}">
-            <div class="param-main">
-              <input type="text" class="param-name" value="${escapeAttr(param.name)}" placeholder="name" spellcheck="false" title="Parameter name" />
-              <select class="param-type" title="Parameter type">${optionsHtml(typeOpts, param.type)}</select>
-              <input type="text" class="param-value" value="${escapeAttr(param.value)}" placeholder="sample" spellcheck="false" title="Sample value for Variables JSON" />
-              <select class="param-mode" title="$variable, or $variable with a default in the signature">
-                ${optionsHtml(
-                  [
-                    { value: "var", label: "$var" },
-                    { value: "default", label: "$ = def" },
-                  ],
-                  param.mode || "var"
-                )}
-              </select>
-              <button type="button" class="param-remove" title="Remove parameter" aria-label="Remove parameter">×</button>
-            </div>
+      .map(
+        (param) => `
+          <div class="param-grid param-card" data-param-id="${param.id}">
+            <input type="text" class="param-name" value="${escapeAttr(param.name)}" placeholder="name" spellcheck="false" aria-label="Variable name" />
+            <select class="param-type" aria-label="Variable type">${optionsHtml(typeOpts, param.type)}</select>
+            <input type="text" class="param-value" value="${escapeAttr(param.value)}" placeholder="value" spellcheck="false" aria-label="Variable value" title="Value sent in the Variables JSON" />
+            <label class="param-default" title="Also write this value as the default in the query signature">
+              <input type="checkbox" class="param-mode" ${param.mode === "default" ? "checked" : ""} aria-label="Use as default" />
+            </label>
+            <button type="button" class="btn-icon is-danger param-remove" title="Remove variable" aria-label="Remove variable">${ICON_CLOSE}</button>
           </div>
-        `;
-      })
+        `
+      )
       .join("");
 
-    return `
-      <div class="block-section params-section">
-        <div class="block-section-head">
-          <span class="block-section-title">Parameters</span>
-          <button type="button" class="btn-mini add-param">+ Add</button>
+    const head = rows
+      ? `
+        <div class="param-grid param-grid-head" aria-hidden="true">
+          <span>Name</span><span>Type</span><span>Value</span><span>Default</span><span></span>
         </div>
-        ${rows || '<p class="param-empty">$variables for filters to reference</p>'}
+      `
+      : "";
+
+    return `
+      <div class="node-section params-section">
+        <div class="section-head">
+          <button type="button" class="btn btn-quiet btn-sm push add-param">+ Add variable</button>
+        </div>
+        ${head}${rows || '<p class="section-empty">Variables become $name in the query and can be used as filter values.</p>'}
       </div>
     `;
   }
 
   function renderRootFiltersSection(node) {
     return `
-      <div class="block-section filters-section">
-        <div class="block-section-head no-margin">
-          <span class="block-section-title">Root filters</span>
-        </div>
-        ${renderFilterGroupPanel(node.rootFilter, node.type, node.params, { edgePath: "" })}
+      <div class="node-section filters-section">
+        ${renderFilterGroupPanel(node.rootFilter, node.type, node.params, {
+          edgePath: "",
+          emptyText: `No conditions. Every ${node.type} is returned.`,
+        })}
       </div>
     `;
   }
 
-  function renderDirectivesSection(node) {
+  function renderQuerySection(node) {
     const toggle = (key) => `
       <button
         type="button"
-        class="directive-toggle${node.directives?.[key] ? " active" : ""}"
+        class="chip directive-toggle${node.directives?.[key] ? " active" : ""}"
         data-directive="${key}"
-        title="Toggle @${key} on this query block"
+        aria-pressed="${!!node.directives?.[key]}"
+        title="Toggle @${key} on this block"
       >@${key}</button>
     `;
+    const resultPlaceholder = innerBlockName(sanitizeName(node.name, `get${node.type}`));
     return `
-      <div class="block-section directives-section">
-        <div class="block-section-head no-margin">
-          <span class="block-section-title">Directives</span>
-          <div class="directive-toggles">
+      <div class="node-section">
+        <div class="kv">
+          <label class="kv-label" for="${node.id}-name">Name</label>
+          <input
+            type="text"
+            id="${node.id}-name"
+            class="query-name-input"
+            value="${escapeAttr(node.name)}"
+            spellcheck="false"
+            title="Operation name: query <name>"
+          />
+          <label class="kv-label" for="${node.id}-result">Result key</label>
+          <input
+            type="text"
+            id="${node.id}-result"
+            class="result-name-input"
+            value="${escapeAttr(node.resultName || "")}"
+            placeholder="${escapeAttr(resultPlaceholder)}"
+            spellcheck="false"
+            title="Key of this block in the response. Leave empty to use the default."
+          />
+          <span class="kv-label">Directives</span>
+          <div class="chips">
             ${toggle("cascade")}
             ${toggle("normalize")}
           </div>
@@ -1196,49 +1462,82 @@
       if (!node.width) node.width = size.w;
       if (!node.height) node.height = size.h;
 
-      // Pop-in only on first appearance, not on every re-render.
-      if (animatedNodes.has(node.id)) el.style.animation = "none";
-      else animatedNodes.add(node.id);
+      const fieldQuery = fieldQueries.get(node.id) || "";
+      const activeTab = nodeTabs.get(node.id) || "fields";
+      const fieldsHtml = `
+        <div class="node-section fields-section">
+          <input type="search" class="field-search" value="${escapeAttr(fieldQuery)}" placeholder="Search fields" spellcheck="false" aria-label="Search fields" />
+          <ul class="field-list">${renderFieldTree(node.type, node.selection, [], 0, node.aliases || {}, node)}</ul>
+        </div>
+      `;
 
       el.innerHTML = `
-        <header class="entity-node-header" data-drag-handle>
-          <span class="dot" style="background:${def.color}"></span>
-          <div class="entity-node-meta">
-            <span class="entity-type-label">${node.type}</span>
-            <input
-              type="text"
-              class="query-name-input"
-              value="${escapeAttr(node.name)}"
-              spellcheck="false"
-              aria-label="Query name"
-              title="Operation name (query <name>)"
-            />
-            <input
-              type="text"
-              class="result-name-input"
-              value="${escapeAttr(node.resultName || "")}"
-              placeholder="${escapeAttr(innerBlockName(sanitizeName(node.name, `get${node.type}`)))}"
-              spellcheck="false"
-              aria-label="Result key"
-              title="Result key — the inner block name (defaults to the operation name without 'get')"
-            />
-          </div>
-          <button type="button" class="entity-node-remove" title="Remove" aria-label="Remove ${node.type}">×</button>
+        <header class="entity-node-header" data-drag-handle title="Drag to move">
+          <span class="dot" style="background:${dotColor(def.color)}"></span>
+          <span class="entity-type-label">${escapeAttr(node.type)}</span>
+          <span class="entity-node-name">${escapeAttr(node.name)}</span>
+          <button type="button" class="btn-icon is-danger entity-node-remove" title="Remove block" aria-label="Remove ${escapeAttr(node.type)} block">${ICON_CLOSE}</button>
         </header>
+        <div class="node-tabs" role="tablist" aria-label="${escapeAttr(node.type)} block">
+          ${renderNodeTabs(node, activeTab)}
+        </div>
         <div class="entity-node-body">
-          ${renderDirectivesSection(node)}
-          ${renderParamsSection(node)}
-          ${renderRootFiltersSection(node)}
-          <ul class="entity-fields">${renderFieldTree(node.type, node.selection, [], 0, node.aliases || {}, node)}</ul>
+          ${nodePanel(node, "fields", activeTab, fieldsHtml)}
+          ${nodePanel(node, "filter", activeTab, renderRootFiltersSection(node))}
+          ${nodePanel(node, "variables", activeTab, renderParamsSection(node))}
+          ${nodePanel(node, "settings", activeTab, renderQuerySection(node))}
         </div>
         <div class="entity-resize" data-resize-handle title="Drag to resize"></div>
       `;
 
       const header = el.querySelector(".entity-node-header");
+      const headerName = el.querySelector(".entity-node-name");
       const nameInput = el.querySelector(".query-name-input");
+      const resultInput = el.querySelector(".result-name-input");
+
+      const tabs = [...el.querySelectorAll(".node-tab")];
+      const showTab = (tabId, { focus = false } = {}) => {
+        nodeTabs.set(node.id, tabId);
+        tabs.forEach((tab) => {
+          const active = tab.dataset.tab === tabId;
+          tab.setAttribute("aria-selected", String(active));
+          tab.tabIndex = active ? 0 : -1;
+          if (active && focus) tab.focus();
+        });
+        el.querySelectorAll(".node-panel").forEach((panel) => {
+          panel.hidden = panel.dataset.panel !== tabId;
+        });
+        el.querySelector(".entity-node-body").scrollTop = 0;
+      };
+      tabs.forEach((tab, i) => {
+        stopDragPropagation(tab);
+        tab.addEventListener("click", () => showTab(tab.dataset.tab));
+        tab.addEventListener("keydown", (e) => {
+          const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+          if (!step) return;
+          e.preventDefault();
+          e.stopPropagation();
+          showTab(tabs[(i + step + tabs.length) % tabs.length].dataset.tab, { focus: true });
+        });
+      });
+
+      const fieldSearch = el.querySelector(".field-search");
+      stopDragPropagation(fieldSearch);
+      fieldSearch.addEventListener("input", () => {
+        fieldQueries.set(node.id, fieldSearch.value);
+        applyFieldSearch(el, fieldSearch.value);
+      });
+      fieldSearch.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && fieldSearch.value) {
+          e.stopPropagation();
+          fieldSearch.value = "";
+          fieldQueries.delete(node.id);
+          applyFieldSearch(el, "");
+        }
+      });
 
       header.addEventListener("pointerdown", (e) => {
-        if (e.target.closest(".entity-node-remove, .query-name-input, .result-name-input")) return;
+        if (e.target.closest(".entity-node-remove")) return;
         e.preventDefault();
         setSelected(node.id);
         const rect = el.getBoundingClientRect();
@@ -1273,11 +1572,14 @@
       stopDragPropagation(nameInput);
       nameInput.addEventListener("input", () => {
         node.name = nameInput.value;
+        headerName.textContent = node.name;
+        resultInput.placeholder = innerBlockName(sanitizeName(node.name, `get${node.type}`));
         refreshQuery();
       });
       nameInput.addEventListener("change", () => {
         node.name = sanitizeName(nameInput.value, defaultName(node.type));
         nameInput.value = node.name;
+        headerName.textContent = node.name;
         refreshQuery();
       });
       nameInput.addEventListener("keydown", (e) => {
@@ -1288,7 +1590,6 @@
         e.stopPropagation();
       });
 
-      const resultInput = el.querySelector(".result-name-input");
       stopDragPropagation(resultInput);
       resultInput.addEventListener("input", () => {
         node.resultName = resultInput.value;
@@ -1340,6 +1641,8 @@
       el.querySelector(".entity-node-remove").addEventListener("click", (e) => {
         e.stopPropagation();
         nodes = nodes.filter((n) => n.id !== node.id);
+        fieldQueries.delete(node.id);
+        nodeTabs.delete(node.id);
         if (selectedNodeId === node.id) selectedNodeId = null;
         renderNodes();
         refreshQuery();
@@ -1351,6 +1654,7 @@
           const key = btn.dataset.directive;
           node.directives[key] = !node.directives[key];
           btn.classList.toggle("active", node.directives[key]);
+          btn.setAttribute("aria-pressed", String(node.directives[key]));
           refreshQuery();
         });
       });
@@ -1387,7 +1691,7 @@
         [nameEl, typeEl, valueEl, modeEl, removeBtn].forEach(stopDragPropagation);
 
         modeEl.addEventListener("change", () => {
-          param.mode = modeEl.value === "default" ? "default" : "var";
+          param.mode = modeEl.checked ? "default" : "var";
           refreshQuery();
         });
         nameEl.addEventListener("input", () => {
@@ -1453,6 +1757,25 @@
         return node.edgeFilters[edgePath];
       };
 
+      const addCondition = (edgePath) => {
+        const group = getFilterGroup(edgePath);
+        const typeName = typeAtEdgePath(node.type, edgePath);
+        const preds = scalarPredicates(typeName);
+        const used = new Set(group.conditions.map((c) => c.predicate));
+        const next = preds.find((p) => !used.has(p.name)) || preds[0];
+        const predName = next?.name || "";
+        group.conditions.push(
+          newFilterCondition(predName, paramTypeForPredicate(typeName, predName))
+        );
+        renderNodes();
+        refreshQuery();
+      };
+
+      el.querySelectorAll(".add-edge-filter").forEach((btn) => {
+        stopDragPropagation(btn);
+        btn.addEventListener("click", () => addCondition(btn.dataset.edgePath || ""));
+      });
+
       el.querySelectorAll(".filter-panel").forEach((panel) => {
         const edgePath = panel.dataset.edgePath || "";
         const group = getFilterGroup(edgePath);
@@ -1469,14 +1792,7 @@
 
         panel.querySelector(".add-filter")?.addEventListener("click", (e) => {
           e.stopPropagation();
-          const preds = scalarPredicates(typeName);
-          const used = new Set(group.conditions.map((c) => c.predicate));
-          const next = preds.find((p) => !used.has(p.name)) || preds[0];
-          const predName = next?.name || "";
-          const type = paramTypeForPredicate(typeName, predName);
-          group.conditions.push(newFilterCondition(predName, type));
-          renderNodes();
-          refreshQuery();
+          addCondition(edgePath);
         });
 
         panel.querySelectorAll(".filter-row").forEach((row) => {
@@ -1512,8 +1828,8 @@
             }
             refreshQuery();
           });
-          modeEl?.addEventListener("change", () => {
-            cond.valueMode = modeEl.value === "param" ? "param" : "literal";
+          modeEl?.addEventListener("click", () => {
+            cond.valueMode = cond.valueMode === "param" ? "literal" : "param";
             if (cond.valueMode === "param") {
               if (!cond.paramName && node.params[0]) cond.paramName = node.params[0].name;
               if (!cond.paramName) {
@@ -1561,7 +1877,7 @@
         });
       });
 
-      el.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+      el.querySelectorAll('.field-check input[type="checkbox"]').forEach((input) => {
         input.addEventListener("change", () => {
           const path = decodePath(input.dataset.path);
           const kind = input.dataset.kind;
@@ -1600,6 +1916,7 @@
       });
 
       canvasEl.appendChild(el);
+      if (fieldQuery) applyFieldSearch(el, fieldQuery);
 
       const savedScroll = fieldScroll.get(node.id);
       if (savedScroll) {
@@ -1984,21 +2301,28 @@
     placeEntity(typeName, x, y);
   });
 
-  if (addEntityBtn) {
-    addEntityBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      toggleEntityMenu();
-    });
-  }
+  addEntityBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleEntityMenu();
+  });
+  emptyAddBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openEntityMenu();
+  });
   document.addEventListener("click", (e) => {
-    if (!entityMenuWrap?.contains(e.target)) closeEntityMenu();
+    if (!entityMenuWrap.contains(e.target)) closeEntityMenu();
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeEntityMenu();
   });
 
   clearBtn.addEventListener("click", () => {
+    if (!nodes.length) return;
+    const count = `${nodes.length} block${nodes.length === 1 ? "" : "s"}`;
+    if (!window.confirm(`Remove all ${count} from the canvas?`)) return;
     nodes = [];
+    fieldQueries.clear();
+    nodeTabs.clear();
     selectedNodeId = null;
     clearDqlDirty();
     clearWorkspace();
@@ -2030,7 +2354,6 @@
     schemaIsSample = false;
     nodes = [];
     selectedNodeId = null;
-    animatedNodes.clear();
 
     drafts.forEach((draft, i) => {
       const withIds = (group) => {
@@ -2164,9 +2487,7 @@
     if (e.target.closest("input, textarea, select, .monaco-editor")) return;
     e.preventDefault();
     try {
-      const msg = importQueryText(text, { source: "paste" });
-      canvasEmptyEl.textContent = msg;
-      setTimeout(() => updateEmptyState(), 1600);
+      importQueryText(text, { source: "paste" });
     } catch (err) {
       // Drop the text into the DQL editor so the user can fix it.
       clearDqlDirty();
@@ -2199,7 +2520,6 @@
     schemaIsSample = isSample;
     nodes = [];
     selectedNodeId = null;
-    animatedNodes.clear();
     clearDqlDirty();
     renderDock();
     renderNodes();
@@ -2213,9 +2533,18 @@
       consoleError("Schema parsed, but it contains no usable object types.", "schema");
       return;
     }
+    if (!confirmCanvasReset()) return;
     setSchema(next, { isSample: false });
-    setSchemaStatus(`Loaded ${count} entit${count === 1 ? "y" : "ies"} from ${sourceLabel}.`, "ok");
     consoleInfo(`Loaded ${count} entit${count === 1 ? "y" : "ies"} from ${sourceLabel}`, "schema");
+    closeSchemaModal();
+  }
+
+  /** Switching schema empties the canvas — ask first if there is work on it. */
+  function confirmCanvasReset() {
+    if (!nodes.length) return true;
+    return window.confirm(
+      `Loading a schema clears the canvas (${nodes.length} block${nodes.length === 1 ? "" : "s"}). Continue?`
+    );
   }
 
   function openSchemaModal() {
@@ -2226,6 +2555,7 @@
 
   function closeSchemaModal() {
     schemaModal.hidden = true;
+    loadSchemaBtn.focus();
   }
 
   loadSchemaBtn.addEventListener("click", openSchemaModal);
@@ -2276,10 +2606,107 @@
   });
 
   schemaSampleBtn.addEventListener("click", () => {
+    if (!confirmCanvasReset()) return;
     setSchema(window.DQL_SCHEMA, { isSample: true });
-    setSchemaStatus("Restored the built-in sample schema.", "ok");
-    consoleInfo("Restored the built-in sample schema", "schema");
+    consoleInfo("Switched to the built-in sample schema", "schema");
+    closeSchemaModal();
   });
+
+  /* ---------- Resizable query pane ---------- */
+
+  const SPLIT_KEY = "dql-builder:query-width";
+
+  function setQueryWidth(px) {
+    const total = workspaceEl.clientWidth;
+    const clamped = Math.round(Math.max(280, Math.min(total - 360, px)));
+    workspaceEl.style.setProperty("--query-w", `${clamped}px`);
+    return clamped;
+  }
+
+  try {
+    const saved = Number(localStorage.getItem(SPLIT_KEY));
+    if (saved) setQueryWidth(saved);
+  } catch {
+    /* storage unavailable */
+  }
+
+  function saveQueryWidth() {
+    const w = workspaceEl.querySelector(".query-pane").offsetWidth;
+    try {
+      localStorage.setItem(SPLIT_KEY, String(w));
+    } catch {
+      /* storage unavailable */
+    }
+  }
+
+  splitterEl.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    splitterEl.setPointerCapture(e.pointerId);
+    document.body.classList.add("is-splitting");
+    const left = workspaceEl.getBoundingClientRect().left;
+    const onMove = (ev) => setQueryWidth(ev.clientX - left);
+    const onUp = () => {
+      splitterEl.removeEventListener("pointermove", onMove);
+      splitterEl.removeEventListener("pointerup", onUp);
+      document.body.classList.remove("is-splitting");
+      saveQueryWidth();
+    };
+    splitterEl.addEventListener("pointermove", onMove);
+    splitterEl.addEventListener("pointerup", onUp);
+  });
+
+  splitterEl.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const current = workspaceEl.querySelector(".query-pane").offsetWidth;
+    setQueryWidth(current + (e.key === "ArrowRight" ? 24 : -24));
+    saveQueryWidth();
+  });
+
+  /* ---------- Theme ---------- */
+
+  const THEME_KEY = "dql-builder:theme";
+  const themeBtn = document.getElementById("themeBtn");
+  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+  function currentTheme() {
+    return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+  }
+
+  function monacoThemeName() {
+    return currentTheme() === "dark" ? "dql-dark" : "dql-light";
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    const label = `Switch to ${theme === "dark" ? "light" : "dark"} theme`;
+    themeBtn.title = label;
+    themeBtn.setAttribute("aria-label", label);
+    if (typeof monaco !== "undefined") monaco.editor.setTheme(monacoThemeName());
+  }
+
+  themeBtn.addEventListener("click", () => {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch {
+      /* storage unavailable */
+    }
+    applyTheme(next);
+  });
+
+  // Follow the OS setting until the user picks a theme explicitly.
+  darkQuery.addEventListener("change", (e) => {
+    let saved = null;
+    try {
+      saved = localStorage.getItem(THEME_KEY);
+    } catch {
+      /* storage unavailable */
+    }
+    if (!saved) applyTheme(e.matches ? "dark" : "light");
+  });
+
+  applyTheme(currentTheme());
 
   /* ---------- Init ---------- */
 
