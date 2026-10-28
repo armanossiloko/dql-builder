@@ -14,7 +14,11 @@
 window.DQLQueryParser = (() => {
   const PARAM_TYPES = ["string", "int", "float", "bool"];
 
-  /** Strip block, line (//), and hash (#) comments without touching string literals. */
+  /**
+   * Blank out block, line (//), and hash (#) comments without touching string
+   * literals. Comments become spaces (newlines stay), so offsets into the
+   * result still point at the same line and column of the original text.
+   */
   function stripComments(src) {
     const input = String(src || "");
     let out = "";
@@ -42,17 +46,18 @@ window.DQLQueryParser = (() => {
       }
 
       if (ch === "/" && next === "*") {
-        i += 2;
-        while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i += 1;
-        i += 1; // land on '/'
-        out += " ";
+        const end = input.indexOf("*/", i + 2);
+        const stop = end < 0 ? input.length : end + 2;
+        out += input.slice(i, stop).replace(/[^\n]/g, " ");
+        i = stop - 1;
         continue;
       }
 
       if ((ch === "/" && next === "/") || ch === "#") {
-        while (i < input.length && input[i] !== "\n") i += 1;
-        i -= 1;
-        out += " ";
+        const end = input.indexOf("\n", i);
+        const stop = end < 0 ? input.length : end;
+        out += " ".repeat(stop - i);
+        i = stop - 1;
         continue;
       }
 
@@ -64,6 +69,42 @@ window.DQLQueryParser = (() => {
   function skipWs(src, i) {
     while (i < src.length && /\s/.test(src[i])) i += 1;
     return i;
+  }
+
+  /* Error positions: `err.offset` is relative to the string being parsed and
+     is rebased to the full query text on the way out. */
+
+  function fail(message, offset) {
+    const err = new Error(message);
+    err.offset = offset;
+    throw err;
+  }
+
+  /** Errors from `fn` that carry no position get `offset`. */
+  function at(offset, fn) {
+    try {
+      return fn();
+    } catch (err) {
+      if (err.offset == null) err.offset = offset;
+      throw err;
+    }
+  }
+
+  /** `fn` parses a substring starting at `base`; rebase its error positions. */
+  function within(base, fn) {
+    try {
+      return fn();
+    } catch (err) {
+      err.offset = (err.offset ?? 0) + base;
+      throw err;
+    }
+  }
+
+  function lineColumn(text, offset) {
+    const before = String(text).slice(0, Math.max(0, offset));
+    const line = before.split("\n").length;
+    const column = offset - before.lastIndexOf("\n");
+    return { line, column };
   }
 
   function extractBalanced(src, openIdx, openCh = "{", closeCh = "}") {
@@ -351,49 +392,53 @@ window.DQLQueryParser = (() => {
       i = skipWs(src, i);
       if (i >= src.length) break;
 
-      let alias = null;
+      const fieldStart = i;
       let pred = readPredicate(src, i);
       if (!pred) {
         // Skip unknown tokens to avoid infinite loops.
         i += 1;
         continue;
       }
-      i = pred.end;
-      i = skipWs(src, i);
+      i = at(fieldStart, () => {
+        let alias = null;
+        let j = skipWs(src, pred.end);
 
-      const asWord = readIdent(src, i);
-      if (asWord && asWord.value === "as") {
-        throw new Error(
-          `Field variables like "${pred.value} as …" are not supported yet; use a separate var block`
-        );
-      }
+        const asWord = readIdent(src, j);
+        if (asWord && asWord.value === "as") {
+          fail(
+            `Field variables like "${pred.value} as …" are not supported yet; use a separate var block`,
+            fieldStart
+          );
+        }
 
-      if (src[i] === ":") {
-        alias = pred.value;
-        i += 1;
-        pred = readPredicate(src, i);
-        if (!pred) throw new Error(`Expected predicate after alias '${alias}:'`);
-        i = pred.end;
-      }
+        if (src[j] === ":") {
+          alias = pred.value;
+          j += 1;
+          pred = readPredicate(src, j);
+          if (!pred) fail(`Expected predicate after alias '${alias}:'`, j);
+          j = pred.end;
+        }
 
-      const dirs = parseDirectivesAndFilter(src, i);
-      i = dirs.end;
-      i = skipWs(src, i);
+        const dirs = parseDirectivesAndFilter(src, j);
+        j = skipWs(src, dirs.end);
 
-      let children = null;
-      if (src[i] === "{") {
-        const bal = extractBalanced(src, i);
-        children = parseSelection(bal.inner);
-        i = bal.end;
-      }
+        let children = null;
+        if (src[j] === "{") {
+          const open = j;
+          const bal = extractBalanced(src, open);
+          children = within(open + 1, () => parseSelection(bal.inner));
+          j = bal.end;
+        }
 
-      fields.push({
-        alias: alias || null,
-        name: pred.value,
-        filterGroup: dirs.filterGroup,
-        cascade: dirs.cascade,
-        normalize: dirs.normalize,
-        children,
+        fields.push({
+          alias: alias || null,
+          name: pred.value,
+          filterGroup: dirs.filterGroup,
+          cascade: dirs.cascade,
+          normalize: dirs.normalize,
+          children,
+        });
+        return j;
       });
     }
     return fields;
@@ -406,8 +451,9 @@ window.DQLQueryParser = (() => {
    */
   function parseRootBlock(body, start = 0) {
     let i = skipWs(body, start);
+    const blockStart = i;
     const first = readIdent(body, i);
-    if (!first) throw new Error("Expected result key after query '{'");
+    if (!first) fail("Expected result key after query '{'", i);
     i = first.end;
 
     let varName = null;
@@ -416,16 +462,17 @@ window.DQLQueryParser = (() => {
     if (asWord && asWord.value === "as") {
       varName = first.value;
       resultName = readIdent(body, asWord.end);
-      if (!resultName) throw new Error(`Expected a block after "${varName} as"`);
+      if (!resultName) fail(`Expected a block after "${varName} as"`, asWord.end);
       i = resultName.end;
     } else if (first.value === "var") {
-      throw new Error('Name the var block, e.g. "ids as var(func: …)"');
+      fail('Name the var block, e.g. "ids as var(func: …)"', blockStart);
     }
 
     i = skipWs(body, i);
-    if (body[i] !== "(") throw new Error(`Expected (func: …) on block "${resultName.value}"`);
+    if (body[i] !== "(") fail(`Expected (func: …) on block "${resultName.value}"`, i);
 
-    const argsBal = extractBalanced(body, i, "(", ")");
+    const argsStart = i;
+    const argsBal = at(argsStart, () => extractBalanced(body, argsStart, "(", ")"));
     const args = argsBal.inner;
     i = argsBal.end;
 
@@ -435,14 +482,16 @@ window.DQLQueryParser = (() => {
       args.match(/func\s*:\s*type\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i);
     const uidMatch = args.match(/func\s*:\s*uid\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i);
     if (!typeMatch && !uidMatch) {
-      throw new Error('Expected func: type("TypeName") or func: uid(variable) on root block');
+      fail('Expected func: type("TypeName") or func: uid(variable) on root block', argsStart + 1);
     }
 
-    const dirs = parseDirectivesAndFilter(body, i);
+    const dirsStart = i;
+    const dirs = at(dirsStart, () => parseDirectivesAndFilter(body, dirsStart));
     i = dirs.end;
     i = skipWs(body, i);
-    if (body[i] !== "{") throw new Error("Expected selection '{' on root block");
-    const sel = extractBalanced(body, i);
+    if (body[i] !== "{") fail("Expected selection '{' on root block", i);
+    const selStart = i;
+    const sel = at(selStart, () => extractBalanced(body, selStart));
 
     return {
       block: {
@@ -453,7 +502,7 @@ window.DQLQueryParser = (() => {
         cascade: dirs.cascade,
         normalize: dirs.normalize,
         filterGroup: dirs.filterGroup,
-        selection: parseSelection(sel.inner),
+        selection: within(selStart + 1, () => parseSelection(sel.inner)),
       },
       end: sel.end,
     };
@@ -484,9 +533,27 @@ window.DQLQueryParser = (() => {
     }
   }
 
+  /**
+   * Parse failures carry `line` and `column` (1-based) of the query text, and
+   * the message ends with "(line N, column M)".
+   */
   function parse(text) {
-    const src = stripComments(text).trim();
-    if (!src) throw new Error("Nothing to parse");
+    const raw = String(text || "");
+    try {
+      return parseOperations(stripComments(raw));
+    } catch (err) {
+      if (err.offset != null) {
+        const pos = lineColumn(raw, Math.min(err.offset, raw.length));
+        err.line = pos.line;
+        err.column = pos.column;
+        err.message = `${err.message} (line ${pos.line}, column ${pos.column})`;
+      }
+      throw err;
+    }
+  }
+
+  function parseOperations(src) {
+    if (!src.trim()) throw new Error("Nothing to parse");
     if (!/\bquery\b/i.test(src)) {
       throw new Error("Expected one or more `query Name { ... }` operations");
     }
@@ -498,19 +565,22 @@ window.DQLQueryParser = (() => {
     let opIndex = 0;
     while ((m = re.exec(src))) {
       const opName = m[1];
-      const params = parseSignature(m[2] || "");
+      const params = at(m.index, () => parseSignature(m[2] || ""));
       const openIdx = m.index + m[0].length - 1;
-      const bal = extractBalanced(src, openIdx);
+      const bal = at(m.index, () => extractBalanced(src, openIdx));
 
       const blocks = [];
       let j = 0;
       while (skipWs(bal.inner, j) < bal.inner.length) {
-        const { block, end } = parseRootBlock(bal.inner, j);
+        const from = j;
+        const { block, end } = within(openIdx + 1, () =>
+          at(skipWs(bal.inner, from), () => parseRootBlock(bal.inner, from))
+        );
         blocks.push(block);
         j = end;
       }
-      if (!blocks.length) throw new Error(`Query ${opName} has no blocks`);
-      resolveVarTypes(blocks, opName);
+      if (!blocks.length) fail(`Query ${opName} has no blocks`, m.index);
+      at(m.index, () => resolveVarTypes(blocks, opName));
 
       blocks.forEach((block) => operations.push({ opName, opIndex, params, ...block }));
       opIndex += 1;
