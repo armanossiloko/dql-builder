@@ -2,11 +2,14 @@
  * Parse DQL query text into canvas-ready blocks.
  * Supports the subset the builder emits (and common hand-written variants):
  *   query Name($p: string = "x") {
- *     Result(func: type("Type")) @filter(...) @cascade @normalize {
+ *     ids as var(func: type("Type")) @filter(...) { ... }
+ *     Result(func: uid(ids)) @filter(...) @cascade @normalize {
  *       alias: predicate
- *       edge @filter(...) { ... }
+ *       edge @filter(uid(ids)) { ... }
  *     }
  *   }
+ * Every root block becomes one canvas block; blocks that define a variable
+ * (`ids as var(...)`) and blocks that use it (`uid(ids)`) are linked.
  */
 window.DQLQueryParser = (() => {
   const PARAM_TYPES = ["string", "int", "float", "bool"];
@@ -358,6 +361,13 @@ window.DQLQueryParser = (() => {
       i = pred.end;
       i = skipWs(src, i);
 
+      const asWord = readIdent(src, i);
+      if (asWord && asWord.value === "as") {
+        throw new Error(
+          `Field variables like "${pred.value} as …" are not supported yet; use a separate var block`
+        );
+      }
+
       if (src[i] === ":") {
         alias = pred.value;
         i += 1;
@@ -389,13 +399,31 @@ window.DQLQueryParser = (() => {
     return fields;
   }
 
-  function parseRootBlock(body) {
-    let i = skipWs(body, 0);
-    const resultName = readIdent(body, i);
-    if (!resultName) throw new Error("Expected result key after query '{'");
-    i = resultName.end;
+  /**
+   * Parse one root block starting at `start`:
+   *   Key(func: type("T")) …, Key(func: uid(v)) …, v as var(func: …) …, v as Key(func: …) …
+   * Returns { block, end }.
+   */
+  function parseRootBlock(body, start = 0) {
+    let i = skipWs(body, start);
+    const first = readIdent(body, i);
+    if (!first) throw new Error("Expected result key after query '{'");
+    i = first.end;
+
+    let varName = null;
+    let resultName = first;
+    const asWord = readIdent(body, i);
+    if (asWord && asWord.value === "as") {
+      varName = first.value;
+      resultName = readIdent(body, asWord.end);
+      if (!resultName) throw new Error(`Expected a block after "${varName} as"`);
+      i = resultName.end;
+    } else if (first.value === "var") {
+      throw new Error('Name the var block, e.g. "ids as var(func: …)"');
+    }
+
     i = skipWs(body, i);
-    if (body[i] !== "(") throw new Error("Expected (func: type(...)) on root block");
+    if (body[i] !== "(") throw new Error(`Expected (func: …) on block "${resultName.value}"`);
 
     const argsBal = extractBalanced(body, i, "(", ")");
     const args = argsBal.inner;
@@ -405,8 +433,10 @@ window.DQLQueryParser = (() => {
       args.match(/func\s*:\s*type\s*\(\s*"([^"]+)"\s*\)/i) ||
       args.match(/func\s*:\s*type\s*\(\s*'([^']+)'\s*\)/i) ||
       args.match(/func\s*:\s*type\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i);
-    if (!typeMatch) throw new Error('Expected func: type("TypeName") on root block');
-    const typeName = typeMatch[1];
+    const uidMatch = args.match(/func\s*:\s*uid\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/i);
+    if (!typeMatch && !uidMatch) {
+      throw new Error('Expected func: type("TypeName") or func: uid(variable) on root block');
+    }
 
     const dirs = parseDirectivesAndFilter(body, i);
     i = dirs.end;
@@ -415,13 +445,43 @@ window.DQLQueryParser = (() => {
     const sel = extractBalanced(body, i);
 
     return {
-      resultName: resultName.value,
-      typeName,
-      cascade: dirs.cascade,
-      normalize: dirs.normalize,
-      filterGroup: dirs.filterGroup,
-      selection: parseSelection(sel.inner),
+      block: {
+        resultName: varName && resultName.value === "var" ? "" : resultName.value,
+        varName,
+        rootVar: typeMatch ? null : uidMatch[1],
+        typeName: typeMatch ? typeMatch[1] : null,
+        cascade: dirs.cascade,
+        normalize: dirs.normalize,
+        filterGroup: dirs.filterGroup,
+        selection: parseSelection(sel.inner),
+      },
+      end: sel.end,
     };
+  }
+
+  /** Blocks starting from uid(v) take the type of the block that defines v. */
+  function resolveVarTypes(blocks, opName) {
+    const typeOfVar = new Map();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      blocks.forEach((b) => {
+        if (!b.typeName && b.rootVar && typeOfVar.has(b.rootVar)) {
+          b.typeName = typeOfVar.get(b.rootVar);
+          changed = true;
+        }
+        if (b.varName && b.typeName && !typeOfVar.has(b.varName)) {
+          typeOfVar.set(b.varName, b.typeName);
+          changed = true;
+        }
+      });
+    }
+    const unresolved = blocks.find((b) => !b.typeName);
+    if (unresolved) {
+      throw new Error(
+        `A block in query ${opName} starts from uid(${unresolved.rootVar}), but no block there defines ${unresolved.rootVar}`
+      );
+    }
   }
 
   function parse(text) {
@@ -431,20 +491,29 @@ window.DQLQueryParser = (() => {
       throw new Error("Expected one or more `query Name { ... }` operations");
     }
 
+    // One entry per root block; blocks of the same operation share opIndex and params.
     const operations = [];
     const re = /\bquery\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\((?:[^()"']|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')*\))?\s*\{/gi;
     let m;
+    let opIndex = 0;
     while ((m = re.exec(src))) {
       const opName = m[1];
-      const signature = m[2] || "";
+      const params = parseSignature(m[2] || "");
       const openIdx = m.index + m[0].length - 1;
       const bal = extractBalanced(src, openIdx);
-      const root = parseRootBlock(bal.inner);
-      operations.push({
-        opName,
-        params: parseSignature(signature),
-        ...root,
-      });
+
+      const blocks = [];
+      let j = 0;
+      while (skipWs(bal.inner, j) < bal.inner.length) {
+        const { block, end } = parseRootBlock(bal.inner, j);
+        blocks.push(block);
+        j = end;
+      }
+      if (!blocks.length) throw new Error(`Query ${opName} has no blocks`);
+      resolveVarTypes(blocks, opName);
+
+      blocks.forEach((block) => operations.push({ opName, opIndex, params, ...block }));
+      opIndex += 1;
       re.lastIndex = bal.end;
     }
 
@@ -650,32 +719,23 @@ window.DQLQueryParser = (() => {
       return PARAM_TYPES.includes(field.type) ? field.type : null;
     }
 
-    return operations.map((op) => {
+    const nodes = operations.map((op) => {
       const aliases = {};
       const params = [];
       const paramByName = new Map();
       const rootFilter = { op: "AND", conditions: [] };
       const edgeFilters = {};
-
-      (op.params || []).forEach((p) => {
-        const entry = {
-          name: p.name,
-          type: PARAM_TYPES.includes(p.type) ? p.type : "string",
-          value: p.value ?? "",
-          mode: p.mode === "default" ? "default" : "var",
-        };
-        params.push(entry);
-        paramByName.set(p.name, entry);
-      });
+      const signature = new Map((op.params || []).map((p) => [p.name, p]));
 
       function ensureParam(name, type, value) {
         let entry = paramByName.get(name);
         if (!entry) {
+          const declared = signature.get(name);
           entry = {
             name,
-            type: PARAM_TYPES.includes(type) ? type : "string",
-            value: value ?? "",
-            mode: "var",
+            type: PARAM_TYPES.includes(declared?.type) ? declared.type : PARAM_TYPES.includes(type) ? type : "string",
+            value: declared ? declared.value ?? "" : value ?? "",
+            mode: declared?.mode === "default" ? "default" : "var",
           };
           params.push(entry);
           paramByName.set(name, entry);
@@ -710,6 +770,19 @@ window.DQLQueryParser = (() => {
         else rootFilter.op = group.op || rootFilter.op || "AND";
 
         group.filters.forEach((filter) => {
+          // uid(v) / not uid(v): keep nodes that are (not) in a variable.
+          if (filter.unary && /^(not\s+)?uid$/i.test(filter.func)) {
+            target.conditions.push({
+              func: filter.func.toLowerCase(),
+              predicate: "",
+              valueMode: "literal",
+              literal: "",
+              paramName: "",
+              varRef: filter.predicate,
+            });
+            return;
+          }
+
           const leafField = findField(schema[typeName], filter.predicate);
           const leaf = leafField?.name || filter.predicate;
           const schemaType = resolveFieldType(
@@ -777,8 +850,11 @@ window.DQLQueryParser = (() => {
       }
 
       return {
+        opIndex: op.opIndex,
         type: op.typeName,
         name: op.opName,
+        varName: op.varName || "",
+        rootVar: op.rootVar || "",
         resultName,
         selection,
         aliases,
@@ -791,6 +867,23 @@ window.DQLQueryParser = (() => {
         },
       };
     });
+
+    // Declared variables no block uses still belong to the operation: keep them on its first result block.
+    operations.forEach((op, i) => {
+      if (operations.findIndex((o) => o.opIndex === op.opIndex) !== i) return;
+      const opNodes = nodes.filter((n) => n.opIndex === op.opIndex);
+      const host = opNodes.find((n) => !n.varName) || opNodes[0];
+      (op.params || []).forEach((p) => {
+        if (opNodes.some((n) => n.params.some((q) => q.name === p.name))) return;
+        host.params.push({
+          name: p.name,
+          type: PARAM_TYPES.includes(p.type) ? p.type : "string",
+          value: p.value ?? "",
+          mode: p.mode === "default" ? "default" : "var",
+        });
+      });
+    });
+    return nodes;
   }
 
   return { parse, ensureSchema, toNodes };

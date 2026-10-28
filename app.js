@@ -16,11 +16,18 @@
     { value: "uid_in", label: "uid_in" },
     { value: "not eq", label: "not eq" },
     { value: "not has", label: "not has" },
+    { value: "uid", label: "uid" },
+    { value: "not uid", label: "not uid" },
   ];
 
   function isUnaryFilter(func) {
     const f = String(func || "").replace(/^not\s+/i, "").toLowerCase();
     return f === "has";
+  }
+
+  /** uid(v) / not uid(v): keep nodes that are (not) in a query variable. */
+  function isVarFilter(func) {
+    return /^(not\s+)?uid$/i.test(String(func || "").trim());
   }
 
   const canvasEl = document.getElementById("canvas");
@@ -68,8 +75,12 @@
    * @typedef {{
    *   id: string, type: string, name: string, x: number, y: number,
    *   selection: Record<string, any>, params: Param[],
-   *   rootFilter: FilterGroup, edgeFilters: Record<string, FilterGroup>
+   *   rootFilter: FilterGroup, edgeFilters: Record<string, FilterGroup>,
+   *   varName: string, rootVar: string
    * }} QueryNode
+   * varName: when set, the block is `varName as var(...)` and is not returned.
+   * rootVar: when set, the block starts from `uid(rootVar)` instead of its type.
+   * Blocks linked through variables are generated into one operation.
    * @type {QueryNode[]}
    */
   let nodes = [];
@@ -584,6 +595,8 @@
     });
 
     node.params = kept;
+    if (typeof node.varName !== "string") node.varName = "";
+    if (typeof node.rootVar !== "string") node.rootVar = "";
     if (node.width != null) node.width = Math.max(300, Number(node.width) || 380);
     if (node.height != null) node.height = Math.max(240, Number(node.height) || 520);
     return node;
@@ -859,6 +872,127 @@
     return nodes.find((n) => n.id === id);
   }
 
+  /* ---------- Query variables (blocks linked by `name as var` / `uid(name)`) ---------- */
+
+  function filterGroupsOf(node) {
+    return [node.rootFilter, ...Object.values(node.edgeFilters || {})].filter(Boolean);
+  }
+
+  function varDefiner(name) {
+    return name ? nodes.find((n) => n.varName === name) : null;
+  }
+
+  /** Variable names a block reads: where it starts from plus uid() filters anywhere in it. */
+  function varRefs(node) {
+    const refs = new Set();
+    if (node.rootVar) refs.add(node.rootVar);
+    filterGroupsOf(node).forEach((g) =>
+      (g.conditions || []).forEach((c) => {
+        if (isVarFilter(c.func) && c.varRef) refs.add(c.varRef);
+      })
+    );
+    return [...refs];
+  }
+
+  function variableUsers(node) {
+    if (!node.varName) return [];
+    return nodes.filter((n) => n.id !== node.id && varRefs(n).includes(node.varName));
+  }
+
+  /** True when `node` reading `name` would form a loop back to itself. */
+  function createsCycle(node, name) {
+    const seen = new Set();
+    const stack = [name];
+    while (stack.length) {
+      const def = varDefiner(stack.pop());
+      if (!def || seen.has(def.id)) continue;
+      if (def.id === node.id) return true;
+      seen.add(def.id);
+      stack.push(...varRefs(def));
+    }
+    return false;
+  }
+
+  /** Variables of `typeName` that `node` can read without creating a loop. */
+  function usableVars(node, typeName) {
+    return nodes
+      .filter((d) => d.varName && d.id !== node.id && d.type === typeName && !createsCycle(node, d.varName))
+      .map((d) => d.varName);
+  }
+
+  function uniqueVarName(seed, exceptId) {
+    const base = sanitizeName(seed, "ids");
+    let name = base;
+    let i = 2;
+    while (nodes.some((n) => n.id !== exceptId && n.varName === name)) {
+      name = `${base}${i}`;
+      i += 1;
+    }
+    return name;
+  }
+
+  function renameVarRefs(prev, next) {
+    nodes.forEach((n) => {
+      if (n.rootVar === prev) n.rootVar = next;
+      filterGroupsOf(n).forEach((g) =>
+        (g.conditions || []).forEach((c) => {
+          if (isVarFilter(c.func) && c.varRef === prev) c.varRef = next;
+        })
+      );
+    });
+  }
+
+  /** Remove every use of a variable: blocks start from their type again and uid() filters go. */
+  function dropVarRefs(name) {
+    nodes.forEach((n) => {
+      if (n.rootVar === name) n.rootVar = "";
+      if (n.rootFilter) {
+        n.rootFilter.conditions = n.rootFilter.conditions.filter(
+          (c) => !(isVarFilter(c.func) && c.varRef === name)
+        );
+      }
+      Object.entries(n.edgeFilters || {}).forEach(([key, g]) => {
+        g.conditions = (g.conditions || []).filter((c) => !(isVarFilter(c.func) && c.varRef === name));
+        if (!g.conditions.length) delete n.edgeFilters[key];
+      });
+    });
+  }
+
+  /** Arrows from each variable block to the blocks that read it. */
+  function drawLinks() {
+    const paths = [];
+    nodes.forEach((to) => {
+      varRefs(to).forEach((name) => {
+        const from = varDefiner(name);
+        if (!from || from.id === to.id) return;
+        const a = canvasEl.querySelector(`.entity-node[data-id="${from.id}"]`);
+        const b = canvasEl.querySelector(`.entity-node[data-id="${to.id}"]`);
+        if (!a || !b) return;
+        const forward = b.offsetLeft + b.offsetWidth / 2 >= a.offsetLeft + a.offsetWidth / 2;
+        const x1 = forward ? a.offsetLeft + a.offsetWidth : a.offsetLeft;
+        const x2 = forward ? b.offsetLeft : b.offsetLeft + b.offsetWidth;
+        // Anchor on the header row so links stay put while blocks scroll.
+        const y1 = a.offsetTop + 18;
+        const y2 = b.offsetTop + 18;
+        const bend = Math.max(40, Math.abs(x2 - x1) / 2) * (forward ? 1 : -1);
+        paths.push(`
+          <path d="M${x1} ${y1} C${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}" marker-end="url(#link-arrow)" />
+          <text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 8}">${escapeAttr(name)}</text>
+        `);
+      });
+    });
+    canvasSurfaceEl.innerHTML = paths.length
+      ? `<svg class="links" width="100%" height="100%">
+          <defs>
+            <marker id="link-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+              <path d="M0 0L8 4L0 8z" />
+            </marker>
+          </defs>
+          ${paths.join("")}
+        </svg>`
+      : "";
+  }
+
   function setSelected(id) {
     selectedNodeId = id;
     canvasEl.querySelectorAll(".entity-node").forEach((nodeEl) => {
@@ -871,7 +1005,7 @@
 
   const DEFAULT_NODE_W = 420;
   const DEFAULT_NODE_H = 520;
-  const NODE_GAP = 28;
+  const NODE_GAP = 56;
   const CANVAS_PAD = 48;
   const CANVAS_MIN_W = 3200;
   const CANVAS_MIN_H = 2400;
@@ -965,6 +1099,7 @@
     });
     canvasSurfaceEl.style.width = `${Math.ceil(maxR)}px`;
     canvasSurfaceEl.style.height = `${Math.ceil(maxB)}px`;
+    drawLinks();
   }
 
   function closeEntityMenu() {
@@ -1137,7 +1272,20 @@
     `;
   }
 
-  function renderFilterValueControls(cond, params) {
+  function renderFilterValueControls(cond, node, typeName) {
+    const params = node.params;
+    if (isVarFilter(cond.func)) {
+      const names = usableVars(node, typeName);
+      if (cond.varRef && !names.includes(cond.varRef)) names.push(cond.varRef);
+      if (!names.length) {
+        return `<span class="filter-value-blank" title="Turn on “Use as variable” in a ${escapeAttr(typeName)} block's Settings">No ${escapeAttr(typeName)} variable yet</span>`;
+      }
+      return `<select class="filter-var-ref" aria-label="Variable">${optionsHtml(
+        names.map((name) => ({ value: name, label: name })),
+        cond.varRef || ""
+      )}</select>`;
+    }
+
     if (isUnaryFilter(cond.func)) {
       return `<span class="filter-value-blank" title="${escapeAttr(cond.func)} takes no value">No value needed</span>`;
     }
@@ -1173,19 +1321,23 @@
     `;
   }
 
-  function renderFilterGroupPanel(group, typeName, params, { edgePath = "", title = "", emptyText = "" } = {}) {
+  function renderFilterGroupPanel(group, typeName, node, { edgePath = "", title = "", emptyText = "" } = {}) {
     const g = ensureFilterGroup(group);
     const preds = scalarOptionsForType(typeName);
     const rows = g.conditions
       .map(
         (cond) => `
           <div class="filter-row" data-filter-id="${cond.id}">
-            <select class="filter-predicate" aria-label="Predicate">${optionsHtml(
-              preds.length ? preds : [{ value: "", label: "—" }],
-              cond.predicate || ""
-            )}</select>
+            ${
+              isVarFilter(cond.func)
+                ? `<span class="filter-self" title="The ${escapeAttr(typeName)} nodes themselves">${escapeAttr(typeName)}</span>`
+                : `<select class="filter-predicate" aria-label="Predicate">${optionsHtml(
+                    preds.length ? preds : [{ value: "", label: "—" }],
+                    cond.predicate || ""
+                  )}</select>`
+            }
             <select class="filter-func" aria-label="Function">${optionsHtml(FILTER_FUNCS, cond.func || "eq")}</select>
-            ${renderFilterValueControls(cond, params)}
+            ${renderFilterValueControls(cond, node, typeName)}
             <button type="button" class="btn-icon is-danger filter-remove" title="Remove condition" aria-label="Remove condition">${ICON_CLOSE}</button>
           </div>
         `
@@ -1237,7 +1389,7 @@
         if (isObject && checked && field.ofType && schema[field.ofType] && depth < 8) {
           const edgeGroup = node.edgeFilters?.[key];
           if (edgeGroup?.conditions?.length) {
-            edgeFilterHtml = renderFilterGroupPanel(edgeGroup, field.ofType, node.params, {
+            edgeFilterHtml = renderFilterGroupPanel(edgeGroup, field.ofType, node, {
               edgePath: key,
               title: `Filter ${label}`,
             });
@@ -1383,7 +1535,7 @@
   function renderRootFiltersSection(node) {
     return `
       <div class="node-section filters-section">
-        ${renderFilterGroupPanel(node.rootFilter, node.type, node.params, {
+        ${renderFilterGroupPanel(node.rootFilter, node.type, node, {
           edgePath: "",
           emptyText: `No conditions. Every ${node.type} is returned.`,
         })}
@@ -1402,11 +1554,39 @@
       >@${key}</button>
     `;
     const resultPlaceholder = innerBlockName(sanitizeName(node.name, `get${node.type}`));
+    const isVar = !!node.varName;
+    const users = variableUsers(node);
+    const startOptions = [
+      { value: "", label: `All ${node.type}` },
+      ...usableVars(node, node.type).map((name) => ({ value: name, label: `Nodes in ${name}` })),
+    ];
+    const usage = users.length
+      ? `Used by ${users.map((u) => escapeAttr(u.varName || u.name)).join(", ")}.`
+      : "Not used yet. Pick it in another block's Start from, or filter with uid(var). Until then it's left out of the DQL.";
     return `
       <div class="node-section">
         <div class="kv">
-          <label class="kv-label" for="${node.id}-name">Name</label>
+          <span class="kv-label">Variable</span>
+          <div class="var-row">
+            <label class="check-inline" title="Turn this block into name as var(...): it is not returned, other blocks can use its nodes">
+              <input type="checkbox" class="var-toggle" ${isVar ? "checked" : ""} />
+              Use as variable
+            </label>
+            ${
+              isVar
+                ? `<input type="text" class="var-name-input" value="${escapeAttr(node.varName)}" spellcheck="false" aria-label="Variable name" />`
+                : ""
+            }
+          </div>
+          ${isVar ? `<span></span><p class="kv-note${users.length ? "" : " is-warn"}">${usage}</p>` : ""}
+          <label class="kv-label" for="${node.id}-start">Start from</label>
+          <select id="${node.id}-start" class="root-var-select" title="Which ${escapeAttr(node.type)} nodes this block starts from">${optionsHtml(
+            startOptions,
+            node.rootVar || ""
+          )}</select>
+          <label class="kv-label" for="${node.id}-name" ${isVar ? "hidden" : ""}>Name</label>
           <input
+            ${isVar ? "hidden" : ""}
             type="text"
             id="${node.id}-name"
             class="query-name-input"
@@ -1414,8 +1594,9 @@
             spellcheck="false"
             title="Operation name: query <name>"
           />
-          <label class="kv-label" for="${node.id}-result">Result key</label>
+          <label class="kv-label" for="${node.id}-result" ${isVar ? "hidden" : ""}>Result key</label>
           <input
+            ${isVar ? "hidden" : ""}
             type="text"
             id="${node.id}-result"
             class="result-name-input"
@@ -1475,7 +1656,9 @@
         <header class="entity-node-header" data-drag-handle title="Drag to move">
           <span class="dot" style="background:${dotColor(def.color)}"></span>
           <span class="entity-type-label">${escapeAttr(node.type)}</span>
-          <span class="entity-node-name">${escapeAttr(node.name)}</span>
+          ${node.varName ? `<span class="node-tag is-var" title="Defines the variable ${escapeAttr(node.varName)}; not returned">as ${escapeAttr(node.varName)}</span>` : ""}
+          <span class="entity-node-name" ${node.varName ? "hidden" : ""}>${escapeAttr(node.name)}</span>
+          ${node.rootVar ? `<span class="node-tag" title="Starts from the nodes in ${escapeAttr(node.rootVar)}">from ${escapeAttr(node.rootVar)}</span>` : ""}
           <button type="button" class="btn-icon is-danger entity-node-remove" title="Remove block" aria-label="Remove ${escapeAttr(node.type)} block">${ICON_CLOSE}</button>
         </header>
         <div class="node-tabs" role="tablist" aria-label="${escapeAttr(node.type)} block">
@@ -1638,8 +1821,65 @@
         input.addEventListener("keydown", (e) => e.stopPropagation());
       });
 
+      const varToggle = el.querySelector(".var-toggle");
+      stopDragPropagation(varToggle);
+      varToggle.addEventListener("change", () => {
+        if (varToggle.checked) {
+          node.varName = uniqueVarName(`${node.type.charAt(0).toLowerCase()}${node.type.slice(1)}Ids`, node.id);
+        } else {
+          const users = variableUsers(node);
+          if (
+            users.length &&
+            !window.confirm(
+              `${users.length} block${users.length === 1 ? " uses" : "s use"} ${node.varName}. They will start from all their nodes again. Continue?`
+            )
+          ) {
+            varToggle.checked = true;
+            return;
+          }
+          dropVarRefs(node.varName);
+          node.varName = "";
+        }
+        renderNodes();
+        refreshQuery();
+      });
+
+      const varNameInput = el.querySelector(".var-name-input");
+      if (varNameInput) {
+        stopDragPropagation(varNameInput);
+        varNameInput.addEventListener("change", () => {
+          const next = uniqueVarName(varNameInput.value || node.varName, node.id);
+          renameVarRefs(node.varName, next);
+          node.varName = next;
+          renderNodes();
+          refreshQuery();
+        });
+        varNameInput.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            varNameInput.blur();
+          }
+          e.stopPropagation();
+        });
+      }
+
+      const rootVarSelect = el.querySelector(".root-var-select");
+      stopDragPropagation(rootVarSelect);
+      rootVarSelect.addEventListener("change", () => {
+        node.rootVar = rootVarSelect.value;
+        renderNodes();
+        refreshQuery();
+      });
+
       el.querySelector(".entity-node-remove").addEventListener("click", (e) => {
         e.stopPropagation();
+        if (variableUsers(node).length) {
+          consoleWarn(
+            `Removed variable ${node.varName}; blocks that used it start from all their nodes again`,
+            "variables"
+          );
+        }
+        if (node.varName) dropVarRefs(node.varName);
         nodes = nodes.filter((n) => n.id !== node.id);
         fieldQueries.delete(node.id);
         nodeTabs.delete(node.id);
@@ -1804,18 +2044,22 @@
           const modeEl = row.querySelector(".filter-value-mode");
           const literalEl = row.querySelector(".filter-literal");
           const paramEl = row.querySelector(".filter-param");
+          const varRefEl = row.querySelector(".filter-var-ref");
           const removeBtn = row.querySelector(".filter-remove");
 
-          [funcEl, predEl, modeEl, literalEl, paramEl, removeBtn]
+          [funcEl, predEl, modeEl, literalEl, paramEl, varRefEl, removeBtn]
             .filter(Boolean)
             .forEach(stopDragPropagation);
 
           funcEl?.addEventListener("change", () => {
             cond.func = funcEl.value;
-            if (isUnaryFilter(cond.func)) {
+            if (isUnaryFilter(cond.func) || isVarFilter(cond.func)) {
               cond.valueMode = "literal";
               cond.literal = "";
               cond.paramName = "";
+            }
+            if (isVarFilter(cond.func) && !cond.varRef) {
+              cond.varRef = usableVars(node, typeName)[0] || "";
             }
             renderNodes();
             refreshQuery();
@@ -1864,6 +2108,11 @@
           });
           paramEl?.addEventListener("change", () => {
             cond.paramName = paramEl.value;
+            refreshQuery();
+          });
+          varRefEl?.addEventListener("change", () => {
+            cond.varRef = varRefEl.value;
+            renderNodes();
             refreshQuery();
           });
           removeBtn?.addEventListener("click", () => {
@@ -1955,6 +2204,8 @@
       directives: { cascade: false, normalize: false },
       aliases: {},
       resultName: "",
+      varName: "",
+      rootVar: "",
     });
     selectedNodeId = nodes[nodes.length - 1].id;
     renderNodes();
@@ -2035,19 +2286,6 @@
     });
   }
 
-  function collectParams(roots) {
-    const map = new Map();
-    roots.forEach((node) => {
-      (node.params || []).forEach((param) => {
-        if (param.mode === "literal") return;
-        const name = sanitizeName(param.name, "");
-        if (!name || map.has(name)) return;
-        map.set(name, { ...param, name });
-      });
-    });
-    return [...map.values()];
-  }
-
   /** Format a param's value as a DQL literal ("Alice", 42, true). */
   function formatDqlLiteral(param) {
     if (param.type === "int") {
@@ -2080,6 +2318,9 @@
   }
 
   function formatFilterCondition(cond, typeName) {
+    if (isVarFilter(cond?.func)) {
+      return cond.varRef && varDefiner(cond.varRef) ? `${cond.func}(${cond.varRef})` : null;
+    }
     if (!cond?.func || !cond?.predicate) return null;
     if (isUnaryFilter(cond.func)) return `${cond.func}(${cond.predicate})`;
 
@@ -2128,36 +2369,117 @@
     return result;
   }
 
+  /**
+   * Group blocks into operations. Blocks linked through query variables share
+   * one operation (variables only work inside one); every other block gets its
+   * own. Variable blocks nothing reads are left out: Dgraph rejects unused
+   * variables.
+   */
+  function planOperations() {
+    let pool = nodes.filter((n) => n.varName || hasAnySelection(n.selection));
+    const unused = [];
+    for (;;) {
+      const read = new Set(pool.flatMap(varRefs));
+      const drop = pool.filter((n) => n.varName && !read.has(n.varName));
+      if (!drop.length) break;
+      unused.push(...drop.map((n) => n.varName));
+      pool = pool.filter((n) => !drop.includes(n));
+    }
+
+    const parent = new Map(pool.map((n) => [n.id, n.id]));
+    const find = (id) => (parent.get(id) === id ? id : find(parent.get(id)));
+    pool.forEach((n) =>
+      varRefs(n).forEach((name) => {
+        const def = pool.find((d) => d.varName === name);
+        if (def) parent.set(find(n.id), find(def.id));
+      })
+    );
+
+    const groups = new Map();
+    pool.forEach((n) => {
+      const key = find(n.id);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(n);
+    });
+
+    // Variable definitions before the blocks that read them.
+    const ordered = [...groups.values()].map((members) => {
+      const out = [];
+      const seen = new Set();
+      const visit = (n) => {
+        if (seen.has(n.id)) return;
+        seen.add(n.id);
+        varRefs(n).forEach((name) => {
+          const def = members.find((m) => m.varName === name);
+          if (def) visit(def);
+        });
+        out.push(n);
+      };
+      members.forEach(visit);
+      return out;
+    });
+
+    return { operations: ordered, unused };
+  }
+
   function refreshQuery() {
     try {
-      const roots = nodes.filter((n) => hasAnySelection(n.selection));
-      if (!roots.length) {
-        setOutputs(
-          nodes.length ? "# Pick at least one predicate on a query block." : "",
-          ""
-        );
+      const { operations: groups, unused } = planOperations();
+      const note = unused.length
+        ? `# Not used by any block yet, so left out: ${unused.join(", ")}\n`
+        : "";
+      if (!groups.length) {
+        setOutputs(nodes.length ? note || "# Pick at least one predicate on a query block." : "", "");
         return;
       }
 
-      const names = uniqueBlockNames(roots);
-      const allParams = collectParams(roots);
+      const heads = groups.map((members) => members.find((n) => !n.varName) || members[0]);
+      const names = uniqueBlockNames(heads);
 
-      // One named operation per canvas block, each with its own signature.
-      const operations = roots.map((node, i) => {
-        const filter = formatFilterDirective(node.rootFilter, node.type);
-        const directives =
-          (node.directives?.cascade ? " @cascade" : "") +
-          (node.directives?.normalize ? " @normalize" : "");
-        const body = renderSelection(
-          node.type,
-          node.selection,
-          2,
-          node,
-          "",
-          node.aliases || {}
+      const opParams = groups.map((members) => {
+        const seen = new Set();
+        const out = [];
+        members.forEach((n) =>
+          blockParams(n).forEach((p) => {
+            if (seen.has(p.name)) return;
+            seen.add(p.name);
+            out.push(p);
+          })
         );
+        return out;
+      });
 
-        const params = blockParams(node);
+      const operations = groups.map((members, i) => {
+        const keys = new Set();
+        const blocks = members.map((node) => {
+          const filter = formatFilterDirective(node.rootFilter, node.type);
+          const directives =
+            (node.directives?.cascade ? " @cascade" : "") +
+            (node.directives?.normalize ? " @normalize" : "");
+          const body =
+            renderSelection(node.type, node.selection, 2, node, "", node.aliases || {}) ||
+            `${indent(2)}uid`;
+          const func = node.rootVar && varDefiner(node.rootVar) ? `uid(${node.rootVar})` : `type("${node.type}")`;
+
+          let key;
+          if (node.varName) {
+            key = `${node.varName} as var`;
+          } else {
+            const base =
+              sanitizeName(node.resultName, "") ||
+              innerBlockName(node === heads[i] ? names[i] : sanitizeName(node.name, `get${node.type}`));
+            key = base;
+            for (let n = 2; keys.has(key); n += 1) key = `${base}${n}`;
+            keys.add(key);
+          }
+
+          return (
+            `${indent(1)}${key}(func: ${func})${filter}${directives} {\n` +
+            `${body}\n${indent(1)}}`
+          );
+        });
+
+        const params = opParams[i];
         const signature = params.length
           ? `(${params
               .map(
@@ -2166,39 +2488,34 @@
               )
               .join(", ")})`
           : "";
-        const inner = sanitizeName(node.resultName, "") || innerBlockName(names[i]);
 
-        return (
-          `query ${names[i]}${signature} {\n` +
-          `${indent(1)}${inner}(func: type("${node.type}"))${filter}${directives} {\n` +
-          `${body}\n${indent(1)}}\n}`
-        );
+        return `query ${names[i]}${signature} {\n${blocks.join("\n\n")}\n}`;
       });
 
-      // Single block → flat vars object; multiple → grouped per operation,
+      // One operation → flat vars object; several → grouped per operation,
       // since each operation is executed separately with its own variables.
       let vars = "";
-      if (allParams.length) {
-        const varsFor = (node) => {
+      if (opParams.some((list) => list.length)) {
+        const varsFor = (list) => {
           const obj = {};
-          blockParams(node).forEach((p) => {
+          list.forEach((p) => {
             obj[`$${p.name}`] = formatParamValue(p);
           });
           return obj;
         };
 
-        if (roots.length === 1) {
-          vars = JSON.stringify(varsFor(roots[0]), null, 2);
+        if (groups.length === 1) {
+          vars = JSON.stringify(varsFor(opParams[0]), null, 2);
         } else {
           const grouped = {};
-          roots.forEach((node, i) => {
-            if (blockParams(node).length) grouped[names[i]] = varsFor(node);
+          groups.forEach((_, i) => {
+            if (opParams[i].length) grouped[names[i]] = varsFor(opParams[i]);
           });
           vars = JSON.stringify(grouped, null, 2);
         }
       }
 
-      setOutputs(operations.join("\n\n"), vars);
+      setOutputs(note + operations.join("\n\n"), vars);
     } catch (err) {
       consoleError(err.message || String(err), "query-build");
       setOutputs(`# Query build failed:\n# ${err.message || err}`, "");
@@ -2367,6 +2684,7 @@
             valueMode: c.valueMode === "param" ? "param" : "literal",
             literal: c.literal ?? "",
             paramName: c.paramName || "",
+            varRef: c.varRef || "",
           })),
         };
       };
@@ -2400,6 +2718,8 @@
         },
         aliases: { ...(draft.aliases || {}) },
         resultName: draft.resultName || "",
+        varName: draft.varName || "",
+        rootVar: draft.rootVar || "",
       });
     });
 

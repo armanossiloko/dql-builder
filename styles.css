@@ -26,6 +26,7 @@
   --danger: #c62828;
   --danger-soft: rgba(198, 40, 40, 0.08);
   --info: #1d5fc2;
+  --info-soft: rgba(29, 95, 194, 0.1);
 
   --dot-mix: black;
   --grid-dot: #d5d8de;
@@ -70,6 +71,7 @@
   --danger: #f47c7c;
   --danger-soft: rgba(244, 124, 124, 0.12);
   --info: #8ab4f8;
+  --info-soft: rgba(138, 180, 248, 0.14);
 
   --dot-mix: white;
   --grid-dot: #2c2e34;
@@ -591,6 +593,34 @@ body.is-splitting {
   pointer-events: none;
 }
 
+/* Variable links: from the block that defines a variable to each block that uses it */
+.links {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+}
+
+.links path {
+  fill: none;
+  stroke: var(--info);
+  stroke-width: 1.5;
+}
+
+.links marker path {
+  fill: var(--info);
+  stroke: none;
+}
+
+.links text {
+  fill: var(--info);
+  font: 11px var(--mono);
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+
 .canvas.drag-over {
   box-shadow: inset 0 0 0 2px var(--accent-line);
 }
@@ -699,6 +729,31 @@ body.is-resizing-node {
   white-space: nowrap;
   color: var(--text-faint);
   font: 12px var(--mono);
+}
+
+.entity-node-remove {
+  margin-left: auto;
+}
+
+.node-tag {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 1;
+  min-width: 0;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-muted);
+  font: 11px var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-tag.is-var {
+  background: var(--info-soft);
+  color: var(--info);
 }
 
 /* Tabs: one part of the block at a time */
@@ -833,8 +888,51 @@ body.is-resizing-node {
   font-size: 12px;
 }
 
-.kv input {
+.kv input:not([type="checkbox"]),
+.kv select {
   width: 100%;
+}
+
+.var-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.var-row .var-name-input {
+  flex: 1;
+  width: auto;
+  color: var(--info);
+}
+
+.kv-note {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.kv-note.is-warn {
+  color: var(--warn);
+}
+
+.filter-self {
+  min-width: 0;
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font: 12px var(--mono);
 }
 
 .chips {
